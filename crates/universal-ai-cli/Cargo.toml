@@ -1,0 +1,22 @@
+[package]
+name = "universal-ai-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "CLI for universal-ai (providers, balance, usage, health)"
+
+[[bin]]
+name = "ai"
+path = "src/main.rs"
+
+[dependencies]
+universal-ai = { path = "../universal-ai" }
+clap = { workspace = true }
+tokio = { workspace = true }
+rust_decimal = { workspace = true }
+secrecy = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_json = { workspace = true }
