@@ -113,12 +113,8 @@ async fn deepseek_balance_parsing_via_mock() {
         .await;
 
     let http = universal_ai::http::HttpClient::new(Default::default()).unwrap();
-    let provider = DeepSeek::with_base_url(
-        SecretString::new("sk-test".into()),
-        server.uri(),
-        http,
-    )
-    .unwrap();
+    let provider =
+        DeepSeek::with_base_url(SecretString::new("sk-test".into()), server.uri(), http).unwrap();
 
     let bal = provider.balance().await.unwrap().unwrap();
     assert_eq!(bal.total.to_string(), "42.31");
@@ -141,12 +137,9 @@ async fn anthropic_chat_mock() {
         .await;
 
     let http = universal_ai::http::HttpClient::new(Default::default()).unwrap();
-    let provider = Anthropic::with_base_url(
-        SecretString::new("sk-ant-test".into()),
-        server.uri(),
-        http,
-    )
-    .unwrap();
+    let provider =
+        Anthropic::with_base_url(SecretString::new("sk-ant-test".into()), server.uri(), http)
+            .unwrap();
 
     let client = AiClient::builder().provider(provider).build().unwrap();
     let response = client
@@ -232,5 +225,15 @@ async fn fallback_skips_side_effecting() {
         .await
         .unwrap_err();
     // Should fail without inventing success
-    assert!(err.to_string().contains("provider") || err.to_string().contains("available") || err.to_string().contains("error") || err.to_string().contains("network") || matches!(err, universal_ai::AiError::Provider { .. } | universal_ai::AiError::NoAvailableProvider { .. }));
+    assert!(
+        err.to_string().contains("provider")
+            || err.to_string().contains("available")
+            || err.to_string().contains("error")
+            || err.to_string().contains("network")
+            || matches!(
+                err,
+                universal_ai::AiError::Provider { .. }
+                    | universal_ai::AiError::NoAvailableProvider { .. }
+            )
+    );
 }

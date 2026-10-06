@@ -87,7 +87,7 @@
     "maxSteps": "Max steps",
     "maxRuntime": "Max runtime (seconds)",
     "maxRunCost": "Max run cost (USD)",
-    "permissionsHint": "Tool permissions are enforced by the Tool Executor (shell / fs-write denied by default). Agent allow-list: {{tools}}.",
+    "permissionsHint": "The agent can call only allow-listed tools whose required permissions are granted below (shell / fs-write are denied by the runtime by default). Agent allow-list: {{tools}}.",
     "none": "(none)",
     "lifecycleFlow": "DRAFT → TESTING → READY → PUBLISHED → PAUSED → ARCHIVED",
     "markTesting": "Mark testing",

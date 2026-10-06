@@ -13,7 +13,7 @@ use crate::error::AiResult;
 use crate::health::HealthStatus;
 use crate::http::HttpClient;
 use crate::models::ModelInfo;
-use crate::provider::Provider;
+use crate::provider::{DynProvider, Provider, ProviderCredential};
 use crate::providers::openai_compatible::OpenAICompatible;
 use crate::types::{ChatRequest, ChatResponse, ChatStream, ProviderId};
 
@@ -39,17 +39,33 @@ impl DeepSeek {
 
     /// Shared HTTP.
     pub fn with_http(api_key: impl Into<SecretString>, http: HttpClient) -> AiResult<Self> {
+        Self::create(Some(api_key.into()), None, http)
+    }
+
+    /// Keyless template for managed keys (bound per request).
+    pub(crate) fn template(base_url: Option<&str>, http: HttpClient) -> AiResult<Self> {
+        Self::create(None, base_url, http)
+    }
+
+    fn create(
+        api_key: Option<SecretString>,
+        base_url: Option<&str>,
+        http: HttpClient,
+    ) -> AiResult<Self> {
         let mut caps = ProviderCapabilities::openai_compatible_chat();
         caps.balance = true;
         caps.reasoning = true;
-        let inner = OpenAICompatible::builder()
-            .base_url("https://api.deepseek.com")
-            .api_key(api_key)
+        let mut builder = OpenAICompatible::builder()
+            .base_url(base_url.unwrap_or("https://api.deepseek.com"))
             .provider_id(ProviderId::deepseek())
             .capabilities(caps)
-            .http(http)
-            .build()?;
-        Ok(Self { inner })
+            .http(http);
+        if let Some(key) = api_key {
+            builder = builder.api_key(key);
+        }
+        Ok(Self {
+            inner: builder.build_unauthenticated()?,
+        })
     }
 
     /// For tests against a mock base URL.
@@ -101,7 +117,7 @@ impl Provider for DeepSeek {
                 &ProviderId::deepseek(),
                 Method::GET,
                 &url,
-                Some(&self.inner.api_key),
+                Some(self.inner.credential()?),
                 &[],
                 None::<&()>,
             )
@@ -116,5 +132,11 @@ impl Provider for DeepSeek {
             Ok(_) => Ok(HealthStatus::ok(started.elapsed().as_millis() as u64)),
             Err(err) => Ok(HealthStatus::down(err.to_string())),
         }
+    }
+
+    fn with_credential(&self, credential: &ProviderCredential) -> AiResult<DynProvider> {
+        Ok(Arc::new(Self {
+            inner: self.inner.bound(credential),
+        }))
     }
 }

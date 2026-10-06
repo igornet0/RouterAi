@@ -69,6 +69,11 @@ impl From<serde_json::Error> for RouterError {
 
 impl From<universal_ai::AiError> for RouterError {
     fn from(value: universal_ai::AiError) -> Self {
-        Self::Model(value.to_string())
+        // Budget / pricing refusals are policy outcomes, not model failures.
+        if value.budget_reason().is_some() {
+            Self::BudgetExceeded(value.to_string())
+        } else {
+            Self::Model(value.to_string())
+        }
     }
 }

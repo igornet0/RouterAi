@@ -1,13 +1,14 @@
 //! Provider trait — adapters implement this; capabilities gate optional methods.
 
 use async_trait::async_trait;
+use secrecy::SecretString;
 
 use crate::balance::Balance;
 use crate::capability::{Capability, ProviderCapabilities};
 use crate::error::{AiError, AiResult};
 use crate::health::HealthStatus;
 use crate::models::ModelInfo;
-use crate::types::{ChatRequest, ChatResponse, ChatStream, ProviderId};
+use crate::types::{ChatRequest, ChatResponse, ChatStream, KeyId, ProviderId};
 use crate::usage::{UsageReport, UsageRequest};
 
 /// Core provider adapter interface.
@@ -79,6 +80,74 @@ pub trait Provider: Send + Sync {
     /// Escape hatch for provider-specific JSON / raw ops.
     fn extensions(&self) -> Option<&dyn ProviderExtensions> {
         None
+    }
+
+    /// A copy of this adapter that authenticates every call with `credential` only.
+    ///
+    /// [`crate::AiClient`] calls this once per provider attempt with the API key it
+    /// selected, so the credential belongs to that request: the receiver is never
+    /// modified and concurrent requests never share a bound instance. Adapters that
+    /// cannot accept per-request credentials return an error instead of silently
+    /// using another key.
+    fn with_credential(&self, credential: &ProviderCredential) -> AiResult<DynProvider> {
+        let _ = credential;
+        Err(AiError::Config {
+            message: format!("provider {} does not support managed API keys", self.id()),
+        })
+    }
+}
+
+/// API credential bound to one provider request (usually a managed key).
+#[derive(Clone)]
+pub struct ProviderCredential {
+    key_id: Option<KeyId>,
+    secret: SecretString,
+    base_url: Option<String>,
+}
+
+impl ProviderCredential {
+    /// Ad-hoc credential not tracked by the key manager.
+    pub fn new(secret: SecretString) -> Self {
+        Self {
+            key_id: None,
+            secret,
+            base_url: None,
+        }
+    }
+
+    /// Managed key; `base_url` (when set) overrides the adapter endpoint so the
+    /// secret is only sent to the endpoint it was registered for.
+    pub fn for_key(key_id: KeyId, secret: SecretString, base_url: Option<String>) -> Self {
+        Self {
+            key_id: Some(key_id),
+            secret,
+            base_url: base_url.filter(|u| !u.trim().is_empty()),
+        }
+    }
+
+    /// Managed key record id, if any.
+    pub fn key_id(&self) -> Option<&KeyId> {
+        self.key_id.as_ref()
+    }
+
+    /// Secret value (callers must not log it).
+    pub fn secret(&self) -> &SecretString {
+        &self.secret
+    }
+
+    /// Endpoint override for this key.
+    pub fn base_url(&self) -> Option<&str> {
+        self.base_url.as_deref()
+    }
+}
+
+impl std::fmt::Debug for ProviderCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderCredential")
+            .field("key_id", &self.key_id)
+            .field("secret", &"<redacted>")
+            .field("base_url", &self.base_url)
+            .finish()
     }
 }
 

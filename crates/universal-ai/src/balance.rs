@@ -275,7 +275,10 @@ impl BalanceMonitor {
 }
 
 /// Parse DeepSeek-style balance JSON helper.
-pub fn parse_deepseek_balance(provider: ProviderId, value: &serde_json::Value) -> AiResult<Balance> {
+pub fn parse_deepseek_balance(
+    provider: ProviderId,
+    value: &serde_json::Value,
+) -> AiResult<Balance> {
     let infos = value
         .get("balance_infos")
         .and_then(|v| v.as_array())

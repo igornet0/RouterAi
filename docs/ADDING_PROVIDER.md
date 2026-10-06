@@ -40,4 +40,11 @@ impl Provider for MyProvider {
 
 Prefer composing `OpenAICompatible` when the upstream speaks OpenAI chat/completions.
 
+To work with managed API keys (`client.keys()`), implement
+`Provider::with_credential`: return a copy of the adapter that authenticates with
+`credential.secret()` (and `credential.base_url()` when set) and nothing else. The
+default implementation returns an error, so a provider that cannot bind
+per-request credentials is never silently called with the wrong key. Never put the
+key in the URL; redact it from errors with `AiError::redact_secret`.
+
 For unique features (balance, native tools, etc.), add methods on the concrete type or use `ChatResponse.raw`.

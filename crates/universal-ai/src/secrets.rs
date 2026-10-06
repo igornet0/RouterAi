@@ -75,9 +75,11 @@ impl FileSecretStore {
     pub async fn open(path: impl AsRef<Path>) -> AiResult<Self> {
         let path = path.as_ref().to_path_buf();
         let map = if path.exists() {
-            let data = tokio::fs::read(&path).await.map_err(|e| AiError::SecretStore {
-                message: format!("read failed: {e}"),
-            })?;
+            let data = tokio::fs::read(&path)
+                .await
+                .map_err(|e| AiError::SecretStore {
+                    message: format!("read failed: {e}"),
+                })?;
             let decoded = obfuscate_decode(&data);
             serde_json::from_slice(&decoded).unwrap_or_default()
         } else {

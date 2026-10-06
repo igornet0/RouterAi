@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::agent::Agent;
 use crate::error::{RouterError, RouterResult};
 use crate::ids::ToolId;
 
@@ -84,6 +85,18 @@ pub struct ToolDefinition {
     pub permissions: Permissions,
 }
 
+impl ToolDefinition {
+    /// Function-calling schema offered to the model under `function_name`.
+    pub fn to_model_tool(&self, function_name: impl Into<String>) -> universal_ai::Tool {
+        let parameters = if self.input_schema.is_object() {
+            self.input_schema.clone()
+        } else {
+            json!({ "type": "object" })
+        };
+        universal_ai::Tool::function(function_name, self.description.clone(), parameters)
+    }
+}
+
 /// Runtime tool handler.
 #[async_trait]
 pub trait ToolHandler: Send + Sync {
@@ -158,7 +171,10 @@ impl ToolExecutor {
         self.global_deny.write().await.insert(p);
     }
 
-    /// Execute if allowed.
+    /// Execute an operator-configured tool action (handler / schedule).
+    ///
+    /// `agent_allowed_tools` empty means unrestricted, so this must not be used for
+    /// model-requested calls — agent runs go through [`ToolExecutor::execute_for_agent`].
     pub async fn execute(
         &self,
         tool_id: &str,
@@ -175,17 +191,64 @@ impl ToolExecutor {
             .get(tool_id)
             .await
             .ok_or_else(|| RouterError::NotFound(format!("tool {tool_id}")))?;
+        self.check_global_deny(&def).await?;
+        self.call_handler(tool_id, input).await
+    }
 
-        let deny = self.global_deny.read().await;
-        for p in &def.permissions.allow {
-            if deny.contains(p) {
-                return Err(RouterError::PermissionDenied(format!(
-                    "permission {p:?} denied by runtime policy"
-                )));
-            }
+    /// Resolve a tool for an agent under its policy: the tool must be on the agent's
+    /// allow-list (an empty list grants no tools), registered, not globally denied,
+    /// and every permission it requires must be granted to the agent.
+    pub async fn authorize_for_agent(
+        &self,
+        tool_id: &str,
+        agent: &Agent,
+    ) -> RouterResult<ToolDefinition> {
+        if !agent.tools.iter().any(|t| t == tool_id) {
+            return Err(RouterError::PermissionDenied(format!(
+                "tool {tool_id} not in agent allow-list"
+            )));
         }
-        drop(deny);
+        let def = self
+            .registry
+            .get(tool_id)
+            .await
+            .ok_or_else(|| RouterError::NotFound(format!("tool {tool_id}")))?;
+        self.check_global_deny(&def).await?;
+        if let Some(missing) = def
+            .permissions
+            .allow
+            .iter()
+            .find(|p| !agent.permissions.allows(**p))
+        {
+            return Err(RouterError::PermissionDenied(format!(
+                "tool {tool_id} requires permission {missing:?} not granted to agent"
+            )));
+        }
+        Ok(def)
+    }
 
+    /// Execute a model-requested tool call on behalf of an agent (strict policy).
+    pub async fn execute_for_agent(
+        &self,
+        tool_id: &str,
+        input: Value,
+        agent: &Agent,
+    ) -> RouterResult<Value> {
+        self.authorize_for_agent(tool_id, agent).await?;
+        self.call_handler(tool_id, input).await
+    }
+
+    async fn check_global_deny(&self, def: &ToolDefinition) -> RouterResult<()> {
+        let deny = self.global_deny.read().await;
+        if let Some(p) = def.permissions.allow.iter().find(|p| deny.contains(p)) {
+            return Err(RouterError::PermissionDenied(format!(
+                "permission {p:?} denied by runtime policy"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn call_handler(&self, tool_id: &str, input: Value) -> RouterResult<Value> {
         let handler = self
             .registry
             .handlers
@@ -313,6 +376,37 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, RouterError::PermissionDenied(_)));
+    }
+
+    #[tokio::test]
+    async fn agent_policy_is_strict() {
+        let reg = ToolRegistry::new();
+        BuiltinTools::register_all(&reg).await.unwrap();
+        let exec = ToolExecutor::new(reg);
+
+        // Empty allow-list grants nothing (unlike operator `execute`).
+        let agent = Agent::new("a", "b");
+        let err = exec
+            .execute_for_agent("json.echo", json!({}), &agent)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RouterError::PermissionDenied(_)));
+
+        // Listed, but agent lacks the Network permission web.search needs.
+        let mut agent = Agent::new("a", "b");
+        agent.tools = vec!["web.search".into()];
+        let err = exec
+            .execute_for_agent("web.search", json!({"query": "x"}), &agent)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RouterError::PermissionDenied(_)));
+
+        agent.permissions.allow.insert(Permission::Network);
+        let out = exec
+            .execute_for_agent("web.search", json!({"query": "x"}), &agent)
+            .await
+            .unwrap();
+        assert_eq!(out["query"], "x");
     }
 
     #[tokio::test]

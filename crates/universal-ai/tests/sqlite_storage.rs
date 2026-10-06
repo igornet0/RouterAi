@@ -4,8 +4,8 @@
 
 use rust_decimal::Decimal;
 use universal_ai::{
-    Account, AccountId, AccountStatus, Balance, Currency, ModelId, ProviderId, RequestId,
-    RequestUsage, SqliteStorage, Storage, Usage,
+    Account, AccountId, AccountStatus, Balance, CostAccounting, CostStatus, Currency, ModelId,
+    ProviderId, RequestId, RequestUsage, SqliteStorage, Storage, Usage,
 };
 
 #[tokio::test]
@@ -58,8 +58,7 @@ async fn sqlite_roundtrip() {
             prompt_tokens: 10,
             completion_tokens: 5,
             total_tokens: 15,
-            cached_tokens: None,
-            reasoning_tokens: None,
+            ..Default::default()
         },
         cost: None,
         success: true,
@@ -67,6 +66,15 @@ async fn sqlite_roundtrip() {
         request_json: request_json.clone(),
         response_json: Some(response_json.clone()),
         importance: None,
+        accounting: CostAccounting {
+            status: CostStatus::UsageUnavailable,
+            estimated_cost: Some(Decimal::new(42, 3)),
+            charged_cost: Some(Decimal::new(42, 3)),
+            budget_scope: Some("agent:a1".into()),
+            logical_request_id: Some(request_id),
+            attempt: 2,
+            ..Default::default()
+        },
     };
     store.save_request(&row).await.unwrap();
 
@@ -77,14 +85,15 @@ async fn sqlite_roundtrip() {
     assert_eq!(listed[0].request_json, request_json);
     assert_eq!(listed[0].response_json, Some(response_json));
     assert_eq!(listed[0].importance, None);
+    assert_eq!(
+        listed[0].accounting, row.accounting,
+        "accounting survives restart"
+    );
 
     let loaded = store.get_request(&request_id).await.unwrap().unwrap();
     assert_eq!(loaded.request_id, request_id);
 
-    let rated = store
-        .set_importance(&request_id, Some(7))
-        .await
-        .unwrap();
+    let rated = store.set_importance(&request_id, Some(7)).await.unwrap();
     assert_eq!(rated.importance, Some(7));
 
     let cleared = store.set_importance(&request_id, None).await.unwrap();

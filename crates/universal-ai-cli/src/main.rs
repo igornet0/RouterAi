@@ -69,10 +69,7 @@ enum AccountCmd {
     /// List accounts.
     List,
     /// Add an account.
-    Add {
-        provider: String,
-        name: String,
-    },
+    Add { provider: String, name: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -154,19 +151,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Providers => {
-            println!(
-                "{:<14} {:<12} {}",
-                "Provider", "Chat", "Capabilities"
-            );
-            for p in client.providers() {
-                let caps = p.capabilities();
+            println!("{:<14} {:<12} {}", "Provider", "Chat", "Capabilities");
+            for p in client.provider_summaries() {
+                let caps = &p.capabilities;
                 println!(
                     "{:<14} {:<12} stream={} balance={} models={}",
-                    p.id(),
-                    caps.chat,
-                    caps.streaming,
-                    caps.balance,
-                    caps.model_list
+                    p.id, caps.chat, caps.streaming, caps.balance, caps.model_list
                 );
             }
         }
@@ -225,7 +215,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                         base_url: None,
                     })
                     .await?;
-                println!("added key {} (secret stored securely, not printed)", info.id);
+                println!(
+                    "added key {} (secret stored securely, not printed)",
+                    info.id
+                );
             }
         },
         Commands::Balance => {
@@ -233,22 +226,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 "{:<12} {:<12} {:<12} {}",
                 "Provider", "Currency", "Balance", "Updated"
             );
-            for p in client.providers() {
-                if !p.supports(universal_ai::Capability::Balance) {
+            for p in client.provider_summaries() {
+                if !p.capabilities.supports(universal_ai::Capability::Balance) {
                     continue;
                 }
-                match client.balance_for(&p.id()).await {
+                match client.balance_for(&p.id).await {
                     Ok(Some(b)) => {
-                        let ago = (chrono::Utc::now() - b.updated_at)
-                            .num_seconds()
-                            .max(0);
+                        let ago = (chrono::Utc::now() - b.updated_at).num_seconds().max(0);
                         println!(
                             "{:<12} {:<12} ${:<11} {} sec ago",
                             b.provider, b.currency, b.total, ago
                         );
                     }
-                    Ok(None) => println!("{:<12} (no balance reported)", p.id()),
-                    Err(err) => println!("{:<12} error: {err}", p.id()),
+                    Ok(None) => println!("{:<12} (no balance reported)", p.id),
+                    Err(err) => println!("{:<12} error: {err}", p.id),
                 }
             }
         }
@@ -270,14 +261,11 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             println!("Example prices loaded for deepseek-chat and gpt-4o-mini when CLI starts.");
         }
         Commands::Health => {
-            for p in client.providers() {
-                let status = client.health().check(&p).await?;
+            for p in client.provider_summaries() {
+                let status = client.check_provider_health(&p.id).await?;
                 println!(
                     "{:<14} healthy={} latency={:?} err={:?}",
-                    p.id(),
-                    status.healthy,
-                    status.latency_ms,
-                    status.error
+                    p.id, status.healthy, status.latency_ms, status.error
                 );
             }
         }

@@ -9,6 +9,17 @@ import {
   statusPillClass,
 } from "../api";
 
+/** Mirrors `routerai::Permission` (snake_case). */
+const PERMISSIONS = [
+  "ai",
+  "event_emit",
+  "network",
+  "messaging",
+  "fs_read",
+  "fs_write",
+  "shell",
+];
+
 const TAB_KEYS = [
   "instructions",
   "model",
@@ -353,11 +364,38 @@ export default function AgentBuilder() {
             </>
           )}
           {tab === "permissions" && (
-            <p style={{ color: "var(--muted)" }}>
-              {t("builder.permissionsHint", {
-                tools: agent.tools.join(", ") || t("builder.none"),
-              })}
-            </p>
+            <>
+              <p style={{ color: "var(--muted)", marginTop: 0 }}>
+                {t("builder.permissionsHint", {
+                  tools: agent.tools.join(", ") || t("builder.none"),
+                })}
+              </p>
+              <div className="tool-chips">
+                {PERMISSIONS.map((perm) => {
+                  const allow = agent.permissions?.allow ?? [];
+                  const on = allow.includes(perm);
+                  return (
+                    <button
+                      key={perm}
+                      className={`tool-chip ${on ? "on" : ""}`}
+                      onClick={() =>
+                        setAgent({
+                          ...agent,
+                          permissions: {
+                            ...agent.permissions,
+                            allow: on
+                              ? allow.filter((x) => x !== perm)
+                              : [...allow, perm],
+                          },
+                        })
+                      }
+                    >
+                      {perm}
+                    </button>
+                  );
+                })}
+              </div>
+            </>
           )}
           {tab === "lifecycle" && (
             <>

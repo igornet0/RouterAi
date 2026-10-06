@@ -9,17 +9,16 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::mpsc;
 
 use crate::capability::{ModelCapabilities, ProviderCapabilities};
-use crate::error::{AiError, AiResult};
+use crate::error::{sanitize_message, AiError, AiResult, ProviderErrorDetails};
 use crate::health::HealthStatus;
-use crate::http::HttpClient;
+use crate::http::{error_from_response, transport_error, HttpClient};
 use crate::models::ModelInfo;
-use crate::provider::Provider;
+use crate::provider::{DynProvider, Provider, ProviderCredential};
 use crate::types::{
-    ChatRequest, ChatResponse, ChatStream, FinishReason, Message, ModelId, ProviderId, RequestId,
-    Role, StreamEvent, ToolCall,
+    ChatRequest, ChatResponse, ChatStream, FinishReason, FunctionCall, Message, ModelId,
+    ProviderId, RequestId, Role, StreamEvent, ToolCall,
 };
 use crate::usage::Usage;
 
@@ -96,12 +95,21 @@ impl OpenAICompatibleBuilder {
 
     /// Build provider.
     pub fn build(self) -> AiResult<OpenAICompatible> {
+        if self.api_key.is_none() {
+            return Err(AiError::Config {
+                message: "api_key is required".into(),
+            });
+        }
+        self.build_unauthenticated()
+    }
+
+    /// Build without a static key: credentials come only from
+    /// [`Provider::with_credential`] (managed keys).
+    pub(crate) fn build_unauthenticated(self) -> AiResult<OpenAICompatible> {
         let base_url = self.base_url.ok_or_else(|| AiError::Config {
             message: "base_url is required".into(),
         })?;
-        let api_key = self.api_key.ok_or_else(|| AiError::Config {
-            message: "api_key is required".into(),
-        })?;
+        let api_key = self.api_key;
         let http = match self.http {
             Some(h) => h,
             None => HttpClient::new(Default::default())?,
@@ -127,7 +135,9 @@ impl Default for OpenAICompatibleBuilder {
 #[derive(Clone)]
 pub struct OpenAICompatible {
     pub(crate) base_url: String,
-    pub(crate) api_key: SecretString,
+    /// Static key from the constructor, or the key bound for one request.
+    /// `None` for managed-key templates.
+    pub(crate) api_key: Option<SecretString>,
     pub(crate) provider_id: ProviderId,
     pub(crate) capabilities: ProviderCapabilities,
     pub(crate) http: Arc<HttpClient>,
@@ -154,6 +164,26 @@ impl OpenAICompatible {
         format!("{}/{}", self.base_url, path.trim_start_matches('/'))
     }
 
+    /// Credential for this instance; never falls back to another key.
+    pub(crate) fn credential(&self) -> AiResult<&SecretString> {
+        self.api_key
+            .as_ref()
+            .ok_or_else(|| AiError::Authentication {
+                provider: Some(self.provider_id.clone()),
+                message: "no API key bound to this provider — add an active key".into(),
+            })
+    }
+
+    /// Copy bound to `credential` (and its endpoint, when the key has one).
+    pub(crate) fn bound(&self, credential: &ProviderCredential) -> Self {
+        let mut bound = self.clone();
+        bound.api_key = Some(credential.secret().clone());
+        if let Some(url) = credential.base_url() {
+            bound.base_url = url.trim_end_matches('/').to_string();
+        }
+        bound
+    }
+
     fn header_refs(&self) -> Vec<(&str, &str)> {
         self.extra_headers
             .iter()
@@ -171,15 +201,20 @@ impl OpenAICompatible {
                     Role::Assistant => "assistant",
                     Role::Tool => "tool",
                 };
+                let text = m.content.to_plain_text();
                 let mut obj = json!({
                     "role": role,
-                    "content": m.content.to_plain_text(),
+                    "content": text,
                 });
                 if let Some(id) = &m.tool_call_id {
                     obj["tool_call_id"] = json!(id);
                 }
                 if !m.tool_calls.is_empty() {
                     obj["tool_calls"] = serde_json::to_value(&m.tool_calls).unwrap_or(Value::Null);
+                    if text.is_empty() {
+                        // Assistant turns that only call tools carry `content: null`.
+                        obj["content"] = Value::Null;
+                    }
                 }
                 obj
             })
@@ -192,6 +227,10 @@ impl OpenAICompatible {
             "messages": Self::wire_messages(&request.messages),
             "stream": stream,
         });
+        if stream {
+            // Without this OpenAI-style APIs send no usage at all in streams.
+            body["stream_options"] = json!({ "include_usage": true });
+        }
         if let Some(t) = request.temperature {
             body["temperature"] = json!(t);
         }
@@ -200,6 +239,9 @@ impl OpenAICompatible {
         }
         if let Some(p) = request.top_p {
             body["top_p"] = json!(p);
+        }
+        if !request.stop.is_empty() {
+            body["stop"] = json!(request.stop);
         }
         if !request.tools.is_empty() {
             body["tools"] = serde_json::to_value(&request.tools).unwrap_or(Value::Null);
@@ -223,18 +265,26 @@ impl OpenAICompatible {
             .ok_or_else(|| AiError::Serialization {
                 message: "missing choices".into(),
             })?;
-        let message = choice.get("message").ok_or_else(|| AiError::Serialization {
-            message: "missing message".into(),
-        })?;
+        let message = choice
+            .get("message")
+            .ok_or_else(|| AiError::Serialization {
+                message: "missing message".into(),
+            })?;
         let content = message
             .get("content")
             .and_then(|c| c.as_str())
             .unwrap_or("")
             .to_string();
-        let tool_calls: Vec<ToolCall> = message
+        let tool_calls = message
             .get("tool_calls")
-            .cloned()
-            .and_then(|v| serde_json::from_value(v).ok())
+            .and_then(|v| v.as_array())
+            .map(|calls| {
+                calls
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, c)| parse_wire_tool_call(i, c))
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         let finish = choice
             .get("finish_reason")
@@ -246,20 +296,7 @@ impl OpenAICompatible {
                 "content_filter" => FinishReason::ContentFilter,
                 other => FinishReason::Other(other.to_string()),
             });
-        let usage = raw.get("usage").map(|u| Usage {
-            prompt_tokens: u.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-            completion_tokens: u
-                .get("completion_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0),
-            total_tokens: u.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
-            cached_tokens: u
-                .pointer("/prompt_tokens_details/cached_tokens")
-                .and_then(|v| v.as_u64()),
-            reasoning_tokens: u
-                .pointer("/completion_tokens_details/reasoning_tokens")
-                .and_then(|v| v.as_u64()),
-        });
+        let usage = raw.get("usage").and_then(parse_wire_usage);
 
         Ok(ChatResponse {
             request_id,
@@ -270,6 +307,7 @@ impl OpenAICompatible {
                 name: None,
                 tool_call_id: None,
                 tool_calls,
+                is_error: false,
             },
             finish_reason: finish,
             usage,
@@ -277,6 +315,193 @@ impl OpenAICompatible {
             raw: Some(raw),
         })
     }
+}
+
+/// OpenAI-style `usage` object (`None` for `null` / missing — never zero tokens).
+///
+/// `prompt_tokens_details` / `completion_tokens_details` entries other than the
+/// known text-priced ones are kept in [`Usage::other_tokens`] (`input_<name>` /
+/// `output_<name>`): audio, image or future categories are priced differently,
+/// so a non-zero count makes the cost unknown instead of billing it as text.
+pub(crate) fn parse_wire_usage(u: &Value) -> Option<Usage> {
+    if !u.is_object() {
+        return None;
+    }
+    let n = |ptr: &str| u.pointer(ptr).and_then(|v| v.as_u64());
+    let prompt = n("/prompt_tokens").unwrap_or(0);
+    let completion = n("/completion_tokens").unwrap_or(0);
+    let mut usage = Usage {
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        total_tokens: n("/total_tokens").unwrap_or(prompt + completion),
+        // DeepSeek reports cache hits as `prompt_cache_hit_tokens`.
+        cached_tokens: n("/prompt_tokens_details/cached_tokens")
+            .or_else(|| n("/prompt_cache_hit_tokens")),
+        cache_creation_tokens: None,
+        reasoning_tokens: n("/completion_tokens_details/reasoning_tokens"),
+        other_tokens: Default::default(),
+    };
+    // Categories billed as ordinary text tokens of their parent class.
+    const INPUT_TEXT: &[&str] = &["cached_tokens", "text_tokens"];
+    // Predicted-output tokens are billed as output tokens (included in completion).
+    const OUTPUT_TEXT: &[&str] = &[
+        "reasoning_tokens",
+        "text_tokens",
+        "accepted_prediction_tokens",
+        "rejected_prediction_tokens",
+    ];
+    for (details, prefix, known) in [
+        ("prompt_tokens_details", "input", INPUT_TEXT),
+        ("completion_tokens_details", "output", OUTPUT_TEXT),
+    ] {
+        let Some(obj) = u.get(details).and_then(Value::as_object) else {
+            continue;
+        };
+        for (k, v) in obj {
+            if known.contains(&k.as_str()) {
+                continue;
+            }
+            if let Some(count) = v.as_u64() {
+                let name = k.trim_end_matches("_tokens");
+                usage.other_tokens.insert(format!("{prefix}_{name}"), count);
+            }
+        }
+    }
+    Some(usage)
+}
+
+/// Events carried by one OpenAI-style SSE chunk.
+fn parse_stream_chunk(v: &Value, provider: &ProviderId) -> Vec<AiResult<StreamEvent>> {
+    let mut out = Vec::new();
+    if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
+        let message = err
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| err.to_string());
+        out.push(Err(AiError::Provider {
+            details: ProviderErrorDetails {
+                provider: provider.clone(),
+                http_status: None,
+                provider_error_code: err.get("code").and_then(Value::as_str).map(str::to_string),
+                message: sanitize_message(&message),
+                request_id: None,
+                retryable: false,
+                retry_after_secs: None,
+            },
+        }));
+        return out;
+    }
+    // Non-final chunks carry `"usage": null` when include_usage is on.
+    if let Some(usage) = v.get("usage").and_then(parse_wire_usage) {
+        out.push(Ok(StreamEvent::Usage { usage }));
+    }
+    let Some(choice) = v
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|a| a.first())
+    else {
+        return out;
+    };
+    if let Some(delta) = choice.get("delta") {
+        if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
+            if !text.is_empty() {
+                out.push(Ok(StreamEvent::TextDelta {
+                    text: text.to_string(),
+                }));
+            }
+        }
+        // TODO(streaming-tool-calls): OpenAI streams tool calls as fragments keyed
+        // by `index` (id/name first, then partial `arguments`). This forwards only
+        // chunks that parse as a whole call; incremental accumulation is not
+        // implemented yet, so agents use the non-streaming tool loop.
+        if let Some(calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+            for call in calls {
+                if let Ok(tc) = serde_json::from_value::<ToolCall>(call.clone()) {
+                    out.push(Ok(StreamEvent::ToolCall { call: tc }));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Turn an SSE body into a pull-based [`ChatStream`]: no background task, so
+/// dropping the stream drops the HTTP response and closes the connection at once.
+/// `parse` maps one SSE event to the stream events it carries and whether the
+/// stream ends after them. A transport error or malformed event ends the stream
+/// with an error (never silently skipped).
+pub(crate) fn sse_stream<S, F>(response: reqwest::Response, state: S, parse: F) -> ChatStream
+where
+    S: Send + 'static,
+    F: FnMut(&mut S, &eventsource_stream::Event) -> (Vec<AiResult<StreamEvent>>, bool)
+        + Send
+        + 'static,
+{
+    let es = Box::pin(response.bytes_stream().eventsource());
+    let stream = futures::stream::unfold(Some((es, state, parse)), |cursor| async move {
+        let (mut es, mut state, mut parse) = cursor?;
+        loop {
+            match es.next().await {
+                None => return None,
+                Some(Err(e)) => return Some((vec![Err(sse_error(e))], None)),
+                Some(Ok(event)) => {
+                    let (events, end) = parse(&mut state, &event);
+                    if end {
+                        return Some((events, None));
+                    }
+                    if !events.is_empty() {
+                        return Some((events, Some((es, state, parse))));
+                    }
+                }
+            }
+        }
+    })
+    .flat_map(futures::stream::iter);
+    Box::pin(stream)
+}
+
+fn sse_error(e: eventsource_stream::EventStreamError<reqwest::Error>) -> AiError {
+    match e {
+        eventsource_stream::EventStreamError::Transport(e) => transport_error(e),
+        other => AiError::Serialization {
+            message: sanitize_message(&format!("malformed SSE stream: {other}")),
+        },
+    }
+}
+
+/// Parse the JSON payload of an SSE event, or a terminal serialization error.
+pub(crate) fn sse_json(event: &eventsource_stream::Event) -> Result<Value, AiError> {
+    serde_json::from_str::<Value>(&event.data).map_err(|e| AiError::Serialization {
+        message: sanitize_message(&format!("malformed stream chunk: {e}")),
+    })
+}
+
+/// Parse one `tool_calls[]` entry. Tolerates gateways that omit `type`/`id`
+/// or send `arguments` as an object instead of a JSON string.
+fn parse_wire_tool_call(index: usize, call: &Value) -> Option<ToolCall> {
+    let function = call.get("function")?;
+    let name = function.get("name")?.as_str()?.to_string();
+    let arguments = match function.get("arguments") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Null) | None => "{}".to_string(),
+        Some(other) => other.to_string(),
+    };
+    let id = call
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("call_{index}"));
+    Some(ToolCall {
+        id,
+        call_type: call
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("function")
+            .to_string(),
+        function: FunctionCall { name, arguments },
+    })
 }
 
 #[async_trait]
@@ -305,7 +530,7 @@ impl Provider for OpenAICompatible {
                 &self.provider_id,
                 Method::GET,
                 &self.url("models"),
-                Some(&self.api_key),
+                Some(self.credential()?),
                 &self.header_refs(),
                 None::<&()>,
             )
@@ -335,7 +560,7 @@ impl Provider for OpenAICompatible {
                 &self.provider_id,
                 Method::POST,
                 &self.url("chat/completions"),
-                Some(&self.api_key),
+                Some(self.credential()?),
                 &self.header_refs(),
                 Some(&body),
             )
@@ -350,107 +575,45 @@ impl Provider for OpenAICompatible {
             .send_raw(
                 Method::POST,
                 &self.url("chat/completions"),
-                Some(&self.api_key),
+                Some(self.credential()?),
                 &self.header_refs(),
                 Some(&body),
             )
             .await?;
 
         if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let text = response.text().await.unwrap_or_default();
-            return Err(AiError::from_http_status(
-                self.provider_id.clone(),
-                status,
-                &text,
-                None,
-            ));
+            return Err(error_from_response(&self.provider_id, response)
+                .await
+                .redact_secret(self.credential()?));
         }
 
-        let byte_stream = response.bytes_stream();
-        let mut es = byte_stream.eventsource();
-        let (tx, rx) = mpsc::channel::<Result<StreamEvent, AiError>>(32);
-
-        tokio::spawn(async move {
-            while let Some(item) = es.next().await {
-                let event = match item {
-                    Ok(ev) => ev,
-                    Err(e) => {
-                        let _ = tx.send(Err(AiError::network(e, true))).await;
-                        break;
-                    }
-                };
-                if event.data.trim() == "[DONE]" {
-                    let _ = tx.send(Ok(StreamEvent::Done)).await;
-                    break;
-                }
-                let Ok(v) = serde_json::from_str::<Value>(&event.data) else {
-                    continue;
-                };
-                if let Some(usage) = v.get("usage") {
-                    let _ = tx
-                        .send(Ok(StreamEvent::Usage {
-                            usage: Usage {
-                                prompt_tokens: usage
-                                    .get("prompt_tokens")
-                                    .and_then(|x| x.as_u64())
-                                    .unwrap_or(0),
-                                completion_tokens: usage
-                                    .get("completion_tokens")
-                                    .and_then(|x| x.as_u64())
-                                    .unwrap_or(0),
-                                total_tokens: usage
-                                    .get("total_tokens")
-                                    .and_then(|x| x.as_u64())
-                                    .unwrap_or(0),
-                                cached_tokens: None,
-                                reasoning_tokens: None,
-                            },
-                        }))
-                        .await;
-                }
-                let Some(choice) = v
-                    .get("choices")
-                    .and_then(|c| c.as_array())
-                    .and_then(|a| a.first())
-                else {
-                    continue;
-                };
-                if let Some(delta) = choice.get("delta") {
-                    if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
-                        if !text.is_empty() {
-                            let _ = tx
-                                .send(Ok(StreamEvent::TextDelta {
-                                    text: text.to_string(),
-                                }))
-                                .await;
-                        }
-                    }
-                    if let Some(calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
-                        for call in calls {
-                            if let Ok(tc) = serde_json::from_value::<ToolCall>(call.clone()) {
-                                let _ = tx.send(Ok(StreamEvent::ToolCall { call: tc })).await;
-                            }
-                        }
-                    }
-                }
+        let provider = self.provider_id.clone();
+        Ok(sse_stream(response, (), move |_, event| {
+            if event.data.trim() == "[DONE]" {
+                return (vec![Ok(StreamEvent::Done)], true);
             }
-        });
-
-        let stream = futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
-        });
-        Ok(Box::pin(stream))
+            match sse_json(event) {
+                Ok(v) => {
+                    let events = parse_stream_chunk(&v, &provider);
+                    let failed = events.iter().any(Result::is_err);
+                    (events, failed)
+                }
+                Err(err) => (vec![Err(err)], true),
+            }
+        }))
     }
 
     async fn health(&self) -> AiResult<HealthStatus> {
         let started = Instant::now();
+        if self.api_key.is_none() {
+            return Ok(HealthStatus::down("no API key bound"));
+        }
         let result = self
             .http
             .send_raw(
                 Method::GET,
                 &self.url("models"),
-                Some(&self.api_key),
+                Some(self.credential()?),
                 &self.header_refs(),
                 None::<&()>,
             )
@@ -462,5 +625,9 @@ impl Provider for OpenAICompatible {
             Ok(resp) => Ok(HealthStatus::down(format!("status {}", resp.status()))),
             Err(err) => Ok(HealthStatus::down(err.to_string())),
         }
+    }
+
+    fn with_credential(&self, credential: &ProviderCredential) -> AiResult<DynProvider> {
+        Ok(Arc::new(self.bound(credential)))
     }
 }

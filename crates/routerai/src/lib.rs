@@ -50,7 +50,7 @@ pub use scheduler::{Schedule, ScheduleKind, Scheduler};
 pub use state::{AgentState, StateStore};
 pub use store::{MemoryStore, Store};
 pub use tool::{
-    BuiltinTools, Permission, Permissions, ToolDefinition, ToolExecutor, ToolRegistry,
+    BuiltinTools, Permission, Permissions, ToolDefinition, ToolExecutor, ToolHandler, ToolRegistry,
 };
 
 #[cfg(feature = "sqlite")]
@@ -59,5 +59,11 @@ pub use store::SqliteStore;
 pub use run::{AgentRun, RunStatus, RunStep, RunStepKind};
 pub use usage_bridge::{RunCost, RunUsage};
 
+/// README code blocks are compiled (and the offline ones run) as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../../../README.md")]
+struct ReadmeDoctests;
+
+mod agent_tools;
 mod run;
 mod usage_bridge;

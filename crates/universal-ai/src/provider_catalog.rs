@@ -4,10 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AiError, AiResult};
 use crate::http::HttpClient;
-use crate::provider::DynProvider;
-use crate::providers::{
-    Anthropic, DeepSeek, Gemini, OpenAI, OpenAICompatible, OpenRouter,
-};
+use crate::provider::{DynProvider, ProviderCredential};
+use crate::providers::{Anthropic, DeepSeek, Gemini, OpenAI, OpenAICompatible, OpenRouter};
 use crate::secrets::SecretString;
 use crate::types::ProviderId;
 use std::sync::Arc;
@@ -90,30 +88,41 @@ pub fn provider_catalog() -> Vec<ProviderDescriptor> {
 }
 
 /// Build a [`DynProvider`] from catalog id + API key (+ optional base URL).
+///
+/// The key is a static credential for standalone use. Managed keys should use
+/// [`build_provider_template`] so every request binds the key selected for it.
 pub fn build_provider(
     provider_id: &ProviderId,
     api_key: SecretString,
     base_url: Option<&str>,
     http: HttpClient,
 ) -> AiResult<DynProvider> {
+    let template = build_provider_template(provider_id, base_url, http)?;
+    template.with_credential(&ProviderCredential::new(api_key))
+}
+
+/// Build a keyless adapter for managed keys. It holds no credential: requests
+/// fail unless [`crate::AiClient`] binds a selected key via
+/// [`crate::Provider::with_credential`].
+pub fn build_provider_template(
+    provider_id: &ProviderId,
+    base_url: Option<&str>,
+    http: HttpClient,
+) -> AiResult<DynProvider> {
     let id = provider_id.as_str();
     match id {
-        "openai" => Ok(Arc::new(OpenAI::with_http(api_key, http)?)),
-        "deepseek" => Ok(Arc::new(DeepSeek::with_http(api_key, http)?)),
-        "anthropic" => Ok(Arc::new(Anthropic::with_http(api_key, http)?)),
-        "gemini" => Ok(Arc::new(Gemini::with_http(api_key, http)?)),
-        "openrouter" => Ok(Arc::new(OpenRouter::with_http(api_key, http)?)),
-        "xai" | "grok" => {
-            let url = base_url.unwrap_or("https://api.x.ai/v1");
-            Ok(Arc::new(
-                OpenAICompatible::builder()
-                    .base_url(url)
-                    .api_key(api_key)
-                    .provider_id(ProviderId::xai())
-                    .http(http)
-                    .build()?,
-            ))
-        }
+        "openai" => Ok(Arc::new(OpenAI::template(base_url, http)?)),
+        "deepseek" => Ok(Arc::new(DeepSeek::template(base_url, http)?)),
+        "anthropic" => Ok(Arc::new(Anthropic::template(base_url, http)?)),
+        "gemini" => Ok(Arc::new(Gemini::template(base_url, http)?)),
+        "openrouter" => Ok(Arc::new(OpenRouter::template(base_url, http)?)),
+        "xai" | "grok" => Ok(Arc::new(
+            OpenAICompatible::builder()
+                .base_url(base_url.unwrap_or("https://api.x.ai/v1"))
+                .provider_id(ProviderId::xai())
+                .http(http)
+                .build_unauthenticated()?,
+        )),
         "openai-compatible" | "openai_compatible" => {
             let url = base_url.ok_or_else(|| AiError::InvalidRequest {
                 message: "base_url is required for openai-compatible providers".into(),
@@ -121,10 +130,9 @@ pub fn build_provider(
             Ok(Arc::new(
                 OpenAICompatible::builder()
                     .base_url(url)
-                    .api_key(api_key)
                     .provider_id(ProviderId::openai_compatible())
                     .http(http)
-                    .build()?,
+                    .build_unauthenticated()?,
             ))
         }
         other => {
@@ -137,10 +145,9 @@ pub fn build_provider(
             Ok(Arc::new(
                 OpenAICompatible::builder()
                     .base_url(url)
-                    .api_key(api_key)
                     .provider_id(provider_id.clone())
                     .http(http)
-                    .build()?,
+                    .build_unauthenticated()?,
             ))
         }
     }

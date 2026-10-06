@@ -72,7 +72,7 @@ impl Default for AgentModelPolicy {
 /// Run limits.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentLimits {
-    /// Max agent loop steps.
+    /// Max model turns per run; each tool round-trip uses one. Exceeding it fails the run.
     pub max_steps: u32,
     /// Wall-clock max seconds.
     pub max_runtime_seconds: u64,
@@ -112,7 +112,7 @@ pub struct Agent {
     pub instructions: String,
     /// Model policy (resolved through universal-ai).
     pub model: AgentModelPolicy,
-    /// Allowed tool ids.
+    /// Tool ids the model may call (empty = no tools). Run input cannot extend this.
     #[serde(default)]
     pub tools: Vec<String>,
     /// Tool / capability permissions.

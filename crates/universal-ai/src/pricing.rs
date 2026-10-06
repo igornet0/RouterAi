@@ -10,21 +10,136 @@ use std::sync::RwLock;
 use crate::error::{AiError, AiResult};
 use crate::types::{ModelId, ProviderId};
 
-/// Price sheet entry for a model.
+/// Price sheet entry for a model (USD per 1M tokens per token class).
+///
+/// Every [`TokenClass`] has an explicit policy (see [`ModelPricing::rate`]); a
+/// class whose policy yields no rate makes the cost of any usage in that class
+/// unknown — it is never priced at another class's rate when that could
+/// underestimate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelPricing {
     /// Provider.
     pub provider: ProviderId,
     /// Model.
     pub model: ModelId,
-    /// USD per 1M input tokens.
+    /// USD per 1M uncached input tokens.
     pub input_per_million: Option<Decimal>,
-    /// USD per 1M output tokens.
+    /// USD per 1M non-reasoning output tokens.
     pub output_per_million: Option<Decimal>,
-    /// USD per 1M cached input tokens.
+    /// USD per 1M input tokens read from the prompt cache.
     pub cached_input_per_million: Option<Decimal>,
+    /// USD per 1M input tokens written to the prompt cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_per_million: Option<Decimal>,
+    /// USD per 1M reasoning tokens (when billed differently from output).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_per_million: Option<Decimal>,
     /// When this price becomes effective.
     pub effective_from: DateTime<Utc>,
+}
+
+/// Disjoint token billing classes (see [`crate::usage::TokenBreakdown`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenClass {
+    /// Uncached input.
+    Input,
+    /// Input read from the prompt cache.
+    CachedInput,
+    /// Input written to the prompt cache.
+    CacheCreation,
+    /// Non-reasoning output.
+    Output,
+    /// Reasoning / thinking output.
+    Reasoning,
+}
+
+impl TokenClass {
+    /// All classes.
+    pub const ALL: [TokenClass; 5] = [
+        TokenClass::Input,
+        TokenClass::CachedInput,
+        TokenClass::CacheCreation,
+        TokenClass::Output,
+        TokenClass::Reasoning,
+    ];
+}
+
+/// Where the rate used for a [`TokenClass`] comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RateSource {
+    /// The class's own price field.
+    Explicit,
+    /// Cache reads without a cached rate: billed at the full input rate. Every
+    /// supported provider discounts cache reads, so this can only overestimate.
+    InputRateConservative,
+    /// Reasoning without a reasoning rate: billed at the output rate, which is how
+    /// OpenAI, Anthropic and Gemini bill reasoning tokens.
+    OutputRate,
+}
+
+impl ModelPricing {
+    /// Price with input / output rates only (other classes follow their policy).
+    pub fn per_million(
+        provider: ProviderId,
+        model: impl Into<ModelId>,
+        input: Decimal,
+        output: Decimal,
+    ) -> Self {
+        Self {
+            provider,
+            model: model.into(),
+            input_per_million: Some(input),
+            output_per_million: Some(output),
+            cached_input_per_million: None,
+            cache_write_per_million: None,
+            reasoning_per_million: None,
+            effective_from: Utc::now(),
+        }
+    }
+
+    /// Rate (USD per 1M tokens) for `class`, or `None` when the class cannot be
+    /// priced. Policy:
+    ///
+    /// | class            | rate                                   |
+    /// |------------------|----------------------------------------|
+    /// | `Input`          | `input_per_million`                    |
+    /// | `CachedInput`    | `cached_input_per_million`, else input (overestimate) |
+    /// | `CacheCreation`  | `cache_write_per_million` only (writes cost more than input) |
+    /// | `Output`         | `output_per_million`                   |
+    /// | `Reasoning`      | `reasoning_per_million`, else output   |
+    pub fn rate(&self, class: TokenClass) -> Option<(Decimal, RateSource)> {
+        let explicit = |r: Option<Decimal>| r.map(|r| (r, RateSource::Explicit));
+        match class {
+            TokenClass::Input => explicit(self.input_per_million),
+            TokenClass::CachedInput => explicit(self.cached_input_per_million).or_else(|| {
+                self.input_per_million
+                    .map(|r| (r, RateSource::InputRateConservative))
+            }),
+            TokenClass::CacheCreation => explicit(self.cache_write_per_million),
+            TokenClass::Output => explicit(self.output_per_million),
+            TokenClass::Reasoning => explicit(self.reasoning_per_million)
+                .or_else(|| self.output_per_million.map(|r| (r, RateSource::OutputRate))),
+        }
+    }
+
+    /// Reject negative rates (they would turn usage into credit).
+    pub fn validate(&self) -> AiResult<()> {
+        for class in TokenClass::ALL {
+            if let Some((r, _)) = self.rate(class) {
+                if r.is_sign_negative() {
+                    return Err(AiError::Config {
+                        message: format!(
+                            "negative {class:?} rate for {}/{}",
+                            self.provider, self.model
+                        ),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Async pricing source.
@@ -156,8 +271,20 @@ impl PricingRegistry {
     }
 
     /// Register a static price (runtime-updatable; not baked into adapters).
+    /// A price sheet with a negative rate is ignored (and logged).
     pub fn upsert(&self, pricing: ModelPricing) {
+        if let Err(err) = pricing.validate() {
+            tracing::error!(error = %err, "rejected invalid model pricing");
+            return;
+        }
         self.static_table.upsert(pricing);
+    }
+
+    /// Like [`PricingRegistry::upsert`] but reports invalid price sheets.
+    pub fn try_upsert(&self, pricing: ModelPricing) -> AiResult<()> {
+        pricing.validate()?;
+        self.static_table.upsert(pricing);
+        Ok(())
     }
 
     /// Sync lookup.
@@ -174,6 +301,8 @@ impl PricingRegistry {
             input_per_million: Some(Decimal::new(14, 2)),
             output_per_million: Some(Decimal::new(28, 2)),
             cached_input_per_million: Some(Decimal::new(14, 3)),
+            cache_write_per_million: None,
+            reasoning_per_million: None,
             effective_from: now,
         });
         self.upsert(ModelPricing {
@@ -182,6 +311,8 @@ impl PricingRegistry {
             input_per_million: Some(Decimal::new(15, 2)),
             output_per_million: Some(Decimal::new(60, 2)),
             cached_input_per_million: None,
+            cache_write_per_million: None,
+            reasoning_per_million: None,
             effective_from: now,
         });
     }
@@ -200,7 +331,9 @@ impl PricingProvider for PricingRegistry {
 
 /// Helper for JSON deserialization errors.
 pub fn pricing_parse_error(msg: impl Into<String>) -> AiError {
-    AiError::Serialization { message: msg.into() }
+    AiError::Serialization {
+        message: msg.into(),
+    }
 }
 
 #[cfg(test)]
@@ -210,14 +343,51 @@ mod tests {
     #[test]
     fn static_pricing_roundtrip() {
         let p = StaticPricing::new();
-        p.upsert(ModelPricing {
-            provider: ProviderId::openai(),
-            model: ModelId::new("m"),
-            input_per_million: Some(Decimal::ONE),
-            output_per_million: Some(Decimal::TEN),
-            cached_input_per_million: None,
-            effective_from: Utc::now(),
-        });
+        p.upsert(ModelPricing::per_million(
+            ProviderId::openai(),
+            "m",
+            Decimal::ONE,
+            Decimal::TEN,
+        ));
         assert!(p.get(&ProviderId::openai(), &ModelId::new("m")).is_some());
+    }
+
+    #[test]
+    fn every_class_has_an_explicit_policy() {
+        let mut p =
+            ModelPricing::per_million(ProviderId::anthropic(), "m", Decimal::ONE, Decimal::TEN);
+        assert_eq!(
+            p.rate(TokenClass::Input),
+            Some((Decimal::ONE, RateSource::Explicit))
+        );
+        assert_eq!(
+            p.rate(TokenClass::CachedInput),
+            Some((Decimal::ONE, RateSource::InputRateConservative))
+        );
+        assert_eq!(
+            p.rate(TokenClass::CacheCreation),
+            None,
+            "never priced as input"
+        );
+        assert_eq!(
+            p.rate(TokenClass::Reasoning),
+            Some((Decimal::TEN, RateSource::OutputRate))
+        );
+        p.cache_write_per_million = Some(Decimal::TWO);
+        assert_eq!(
+            p.rate(TokenClass::CacheCreation),
+            Some((Decimal::TWO, RateSource::Explicit))
+        );
+    }
+
+    #[test]
+    fn negative_rates_are_rejected() {
+        let reg = PricingRegistry::new();
+        let bad = ModelPricing::per_million(ProviderId::openai(), "m", -Decimal::ONE, Decimal::ONE);
+        assert!(reg.try_upsert(bad.clone()).is_err());
+        reg.upsert(bad);
+        assert!(reg
+            .get_price_sync(&ProviderId::openai(), &ModelId::new("m"))
+            .is_none());
     }
 }

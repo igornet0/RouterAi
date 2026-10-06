@@ -131,6 +131,9 @@ pub struct Message {
     /// Assistant tool calls.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ToolCall>,
+    /// Tool result reports a failed execution (role Tool only).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_error: bool,
 }
 
 impl Message {
@@ -142,6 +145,7 @@ impl Message {
             name: None,
             tool_call_id: None,
             tool_calls: Vec::new(),
+            is_error: false,
         }
     }
 
@@ -153,6 +157,7 @@ impl Message {
             name: None,
             tool_call_id: None,
             tool_calls: Vec::new(),
+            is_error: false,
         }
     }
 
@@ -164,6 +169,7 @@ impl Message {
             name: None,
             tool_call_id: None,
             tool_calls: Vec::new(),
+            is_error: false,
         }
     }
 
@@ -175,6 +181,61 @@ impl Message {
             name: None,
             tool_call_id: Some(tool_call_id.into()),
             tool_calls: Vec::new(),
+            is_error: false,
+        }
+    }
+
+    /// Assistant message requesting tool calls (content may be empty).
+    pub fn assistant_tool_calls(content: impl Into<Content>, tool_calls: Vec<ToolCall>) -> Self {
+        Self {
+            tool_calls,
+            ..Self::assistant(content)
+        }
+    }
+
+    /// Tool result message (success or failure).
+    pub fn tool_result(result: ToolResult) -> Self {
+        Self {
+            is_error: result.is_error,
+            ..Self::tool(result.tool_call_id, result.content)
+        }
+    }
+}
+
+impl From<ToolResult> for Message {
+    fn from(value: ToolResult) -> Self {
+        Self::tool_result(value)
+    }
+}
+
+/// Outcome of executing a [`ToolCall`], sent back to the model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolResult {
+    /// Id of the call this result answers.
+    pub tool_call_id: String,
+    /// Result payload (usually JSON text).
+    pub content: String,
+    /// Execution failed; content describes the error.
+    #[serde(default)]
+    pub is_error: bool,
+}
+
+impl ToolResult {
+    /// Successful result.
+    pub fn success(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            tool_call_id: tool_call_id.into(),
+            content: content.into(),
+            is_error: false,
+        }
+    }
+
+    /// Failed result (the model sees the error and may retry).
+    pub fn error(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            tool_call_id: tool_call_id.into(),
+            content: content.into(),
+            is_error: true,
         }
     }
 }
@@ -207,6 +268,13 @@ impl Tool {
     }
 }
 
+impl Tool {
+    /// Function name as seen by the model.
+    pub fn name(&self) -> &str {
+        &self.function.name
+    }
+}
+
 /// Function tool schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolFunction {
@@ -229,6 +297,38 @@ pub struct ToolCall {
     pub call_type: String,
     /// Function invocation.
     pub function: FunctionCall,
+}
+
+impl ToolCall {
+    /// Function call with JSON arguments.
+    pub fn function(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: &serde_json::Value,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    /// Function name requested by the model.
+    pub fn name(&self) -> &str {
+        &self.function.name
+    }
+
+    /// Parse arguments as JSON (empty string → `{}`).
+    pub fn arguments_json(&self) -> Result<serde_json::Value, serde_json::Error> {
+        let raw = self.function.arguments.trim();
+        if raw.is_empty() {
+            return Ok(serde_json::Value::Object(Default::default()));
+        }
+        serde_json::from_str(raw)
+    }
 }
 
 /// Function name + arguments JSON string.

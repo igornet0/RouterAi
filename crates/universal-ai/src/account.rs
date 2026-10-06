@@ -161,17 +161,23 @@ impl AccountManager {
 
     /// Get one.
     pub async fn get(&self, id: &AccountId) -> Option<Account> {
-        self.accounts.read().await.iter().find(|a| &a.id == id).cloned()
+        self.accounts
+            .read()
+            .await
+            .iter()
+            .find(|a| &a.id == id)
+            .cloned()
     }
 
     /// Mark checked.
     pub async fn check(&self, id: &AccountId) -> AiResult<Account> {
         let mut g = self.accounts.write().await;
-        let account = g.iter_mut().find(|a| &a.id == id).ok_or_else(|| {
-            AiError::InvalidRequest {
-                message: format!("account not found: {id}"),
-            }
-        })?;
+        let account =
+            g.iter_mut()
+                .find(|a| &a.id == id)
+                .ok_or_else(|| AiError::InvalidRequest {
+                    message: format!("account not found: {id}"),
+                })?;
         account.last_checked_at = Some(Utc::now());
         Ok(account.clone())
     }
@@ -183,11 +189,12 @@ impl AccountManager {
         budget: Option<rust_decimal::Decimal>,
     ) -> AiResult<Account> {
         let mut g = self.accounts.write().await;
-        let account = g.iter_mut().find(|a| &a.id == id).ok_or_else(|| {
-            AiError::InvalidRequest {
-                message: format!("account not found: {id}"),
-            }
-        })?;
+        let account =
+            g.iter_mut()
+                .find(|a| &a.id == id)
+                .ok_or_else(|| AiError::InvalidRequest {
+                    message: format!("account not found: {id}"),
+                })?;
         account.credit_budget = budget;
         Ok(account.clone())
     }
@@ -208,7 +215,9 @@ pub struct ApiKeyManager {
     keys: RwLock<Vec<ApiKeyInfo>>,
     store: Arc<dyn SecretStore>,
     selection: RwLock<KeySelectionStrategy>,
-    rr_counter: std::sync::atomic::AtomicU64,
+    /// Round-robin cursor per provider, so rotation for one provider is not
+    /// skewed by requests to another.
+    rr_cursors: std::sync::Mutex<std::collections::HashMap<ProviderId, u64>>,
 }
 
 impl ApiKeyManager {
@@ -218,7 +227,7 @@ impl ApiKeyManager {
             keys: RwLock::new(Vec::new()),
             store,
             selection: RwLock::new(KeySelectionStrategy::FirstAvailable),
-            rr_counter: std::sync::atomic::AtomicU64::new(0),
+            rr_cursors: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -253,18 +262,20 @@ impl ApiKeyManager {
         Ok(info)
     }
 
-    /// Remove metadata + secret.
+    /// Remove metadata + secret. Metadata goes first so the key stops being
+    /// selectable before its secret disappears.
     pub async fn remove_key(&self, id: &KeyId) -> AiResult<()> {
-        self.store.delete(&Self::storage_key(id)).await?;
-        let mut g = self.keys.write().await;
-        let before = g.len();
-        g.retain(|k| &k.id != id);
-        if g.len() == before {
-            return Err(AiError::InvalidRequest {
-                message: format!("key not found: {id}"),
-            });
+        {
+            let mut g = self.keys.write().await;
+            let before = g.len();
+            g.retain(|k| &k.id != id);
+            if g.len() == before {
+                return Err(AiError::InvalidRequest {
+                    message: format!("key not found: {id}"),
+                });
+            }
         }
-        Ok(())
+        self.store.delete(&Self::storage_key(id)).await
     }
 
     /// List metadata (no secrets).
@@ -294,20 +305,24 @@ impl ApiKeyManager {
 
     async fn set_status(&self, id: &KeyId, status: KeyStatus) -> AiResult<()> {
         let mut g = self.keys.write().await;
-        let key = g.iter_mut().find(|k| &k.id == id).ok_or_else(|| {
-            AiError::InvalidRequest {
+        let key = g
+            .iter_mut()
+            .find(|k| &k.id == id)
+            .ok_or_else(|| AiError::InvalidRequest {
                 message: format!("key not found: {id}"),
-            }
-        })?;
+            })?;
         key.status = status;
         Ok(())
     }
 
     /// Manual rotation: store new secret, deprecate old, activate new.
     pub async fn rotate_key(&self, id: &KeyId, new_secret: SecretString) -> AiResult<ApiKeyInfo> {
-        let old = self.get_key(id).await.ok_or_else(|| AiError::InvalidRequest {
-            message: format!("key not found: {id}"),
-        })?;
+        let old = self
+            .get_key(id)
+            .await
+            .ok_or_else(|| AiError::InvalidRequest {
+                message: format!("key not found: {id}"),
+            })?;
         let new_info = self
             .add_key(AddKeyRequest {
                 provider: old.provider.clone(),
@@ -339,19 +354,30 @@ impl ApiKeyManager {
         let chosen = match strategy {
             KeySelectionStrategy::FirstAvailable => keys.into_iter().next(),
             KeySelectionStrategy::RoundRobin => {
-                let i = self.rr_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let i = {
+                    let mut cursors = self.rr_cursors.lock().unwrap_or_else(|e| e.into_inner());
+                    let cursor = cursors.entry(provider.clone()).or_insert(0);
+                    let i = *cursor;
+                    *cursor = cursor.wrapping_add(1);
+                    i
+                };
                 let len = keys.len().max(1);
                 keys.into_iter().nth((i as usize) % len)
             }
-            KeySelectionStrategy::LeastUsed => keys
-                .into_iter()
-                .min_by_key(|k| k.usage.requests),
+            KeySelectionStrategy::LeastUsed => keys.into_iter().min_by_key(|k| k.usage.requests),
             KeySelectionStrategy::LowestCost => keys
                 .into_iter()
                 .min_by(|a, b| a.usage.total_cost.cmp(&b.usage.total_cost)),
             KeySelectionStrategy::HighestBalance => keys.into_iter().next(),
         };
         Ok(chosen)
+    }
+
+    /// Attribute a finished request to the key that served it.
+    pub async fn record_usage(&self, id: &KeyId, row: &crate::usage::RequestUsage) {
+        if let Some(k) = self.keys.write().await.iter_mut().find(|k| &k.id == id) {
+            k.usage.record(row);
+        }
     }
 
     /// Mark last used.

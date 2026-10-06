@@ -48,8 +48,14 @@ impl RetryPolicy {
     }
 
     /// Should we retry this error given attempts so far (1 = first try done).
+    /// A `Retry-After` longer than `max_delay` is not retried early: the request
+    /// moves on to the fallback policy instead.
     pub fn should_retry(&self, attempts: u32, err: &AiError) -> bool {
-        attempts < self.max_attempts && err.is_retryable()
+        attempts < self.max_attempts
+            && err.is_retryable()
+            && err
+                .retry_after_secs()
+                .map_or(true, |s| Duration::from_secs(s) <= self.max_delay)
     }
 }
 
@@ -131,6 +137,18 @@ mod tests {
         .unwrap();
         assert_eq!(result, 42);
         assert_eq!(count.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn long_retry_after_is_not_retried_early() {
+        let policy = RetryPolicy::default();
+        let rl = |secs| AiError::RateLimit {
+            provider: None,
+            retry_after_secs: Some(secs),
+            message: "wait".into(),
+        };
+        assert!(policy.should_retry(1, &rl(1)));
+        assert!(!policy.should_retry(1, &rl(3600)));
     }
 
     #[tokio::test]

@@ -90,4 +90,10 @@ impl ModelsApi<'_> {
     pub async fn get(&self, model: &str) -> AiResult<Option<ModelInfo>> {
         Ok(self.registry.get(model))
     }
+
+    /// Register / update model metadata. A known `max_output_tokens` lets budgeted
+    /// requests without `max_tokens` be estimated (worst case) instead of rejected.
+    pub fn register(&self, info: ModelInfo) {
+        self.registry.upsert(info);
+    }
 }

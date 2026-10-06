@@ -9,17 +9,16 @@ use chrono::Utc;
 use rust_decimal::Decimal;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
-use universal_ai::{AiClient, Message};
+use universal_ai::{AiClient, Message, ToolCall, ToolResult};
 
 use crate::adapter::{SinkRegistry, SinkTarget};
-use crate::agent::{Agent, AgentStore, AgentStatus, RunMode};
+use crate::agent::{Agent, AgentStatus, AgentStore, RunMode};
+use crate::agent_tools::AgentToolset;
 use crate::audit::AuditLog;
 use crate::config::RuntimeConfig;
 use crate::control::ControlPlane;
 use crate::error::{RouterError, RouterResult};
-use crate::eval::{
-    Dataset, EvaluationReport, RegressionReport, TestCase, TestCaseStore, TestLab,
-};
+use crate::eval::{Dataset, EvaluationReport, RegressionReport, TestCase, TestCaseStore, TestLab};
 use crate::event::{Event, EventBus};
 use crate::handler::{Action, ErrorPolicy, Handler, HandlerEngine};
 use crate::ids::{AgentId, HandlerId, RunId};
@@ -484,10 +483,7 @@ impl RouterRuntime {
                     }
                 }
                 Action::ToolCall { tool_id, input } => {
-                    let _ = self
-                        .tools
-                        .execute(tool_id, input.clone(), &[])
-                        .await?;
+                    let _ = self.tools.execute(tool_id, input.clone(), &[]).await?;
                 }
             }
         }
@@ -526,10 +522,7 @@ impl RouterRuntime {
 
         let mut run = AgentRun::new(agent.id.clone(), input, event_id);
         run.status = RunStatus::Running;
-        run.push_step(
-            RunStepKind::Event,
-            format!("run started ({mode:?})"),
-        );
+        run.push_step(RunStepKind::Event, format!("run started ({mode:?})"));
         self.store.save_run(&run).await?;
 
         let result = self.execute_agent(&agent, &mut run).await;
@@ -538,6 +531,11 @@ impl RouterRuntime {
             Err(RouterError::Cancelled) => {
                 run.cancel();
                 run.push_step(RunStepKind::Error, "cancelled");
+            }
+            Err(RouterError::Timeout) => {
+                run.fail(RouterError::Timeout.to_string());
+                run.status = RunStatus::TimedOut;
+                run.push_step(RunStepKind::Error, "run exceeded max_runtime_seconds");
             }
             Err(err) => {
                 run.fail(err.to_string());
@@ -572,9 +570,7 @@ impl RouterRuntime {
                     .clone()
                     .or_else(|| Some(parent.id.to_string()));
                 if let Some(reply) = parent.metadata.extra.get("reply_to") {
-                    done.metadata
-                        .extra
-                        .insert("reply_to".into(), reply.clone());
+                    done.metadata.extra.insert("reply_to".into(), reply.clone());
                 }
             } else {
                 done.correlation_id = Some(eid.to_string());
@@ -603,81 +599,84 @@ impl RouterRuntime {
             .await
     }
 
+    /// Agent loop: model turn → tool calls (policy-checked) → tool results → next turn,
+    /// until the model answers without tool calls or a limit is hit.
     async fn execute_agent(&self, agent: &Agent, run: &mut AgentRun) -> RouterResult<()> {
-        let started = Instant::now();
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(agent.limits.max_runtime_seconds.max(1));
         let max_steps = agent.limits.max_steps.max(1);
-        let max_runtime = std::time::Duration::from_secs(agent.limits.max_runtime_seconds.max(1));
 
-        // Step 0: optional tool calls requested in input.tools
-        let tool_calls: Vec<Value> = run
-            .input
-            .get("tools")
-            .and_then(|t| t.as_array())
-            .cloned()
-            .unwrap_or_default();
-        for (i, call) in tool_calls.iter().enumerate() {
-            if self.is_cancelled(&run.id).await {
-                return Err(RouterError::Cancelled);
-            }
-            if i as u32 >= max_steps {
-                break;
-            }
-            if started.elapsed() > max_runtime {
-                run.status = RunStatus::TimedOut;
-                return Err(RouterError::Timeout);
-            }
-            let tool_id = call
-                .get("id")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| RouterError::Invalid("tool id required".into()))?;
-            let input = call.get("input").cloned().unwrap_or(json!({}));
-            let tool_started = Instant::now();
-            run.push_step(RunStepKind::Tool, format!("tool {tool_id}"));
-            let out = self.tools.execute(tool_id, input.clone(), &agent.tools).await?;
-            let duration_ms = tool_started.elapsed().as_millis() as u64;
-            if let Some(step) = run.steps.last_mut() {
-                step.detail = Some(json!({
-                    "tool": tool_id,
-                    "input": input,
-                    "output": out,
-                    "duration_ms": duration_ms,
-                }));
-            }
-            run.push_step(RunStepKind::Observe, format!("tool {tool_id} ok"));
+        // Run input is untrusted (webhooks, events): it may not invoke tools directly.
+        if run.input.get("tools").is_some() {
+            run.push_step(
+                RunStepKind::Observe,
+                "input.tools ignored — tools are invoked only by the model under agent policy",
+            );
         }
 
-        // Primary: model call via universal-ai when available
         let message = extract_user_message(&run.input);
-        if let Some(ai) = &self.ai {
-            if self.is_cancelled(&run.id).await {
-                return Err(RouterError::Cancelled);
-            }
-            if started.elapsed() > max_runtime {
-                run.status = RunStatus::TimedOut;
-                return Err(RouterError::Timeout);
-            }
+        let Some(ai) = self.ai.clone() else {
+            // Offline / stub mode without AiClient
+            run.push_step(RunStepKind::Observe, "no AiClient — stub response");
+            run.complete(json!({
+                "text": format!("[stub] processed: {message}"),
+                "stub": true,
+            }));
+            return Ok(());
+        };
 
-            // Budget pre-check (rough)
-            if let Some(max) = agent.budget.max_run_cost {
-                if run.cost > max {
+        let (toolset, withheld) = AgentToolset::resolve(&self.tools, agent).await;
+        for (tool_id, reason) in withheld {
+            run.push_step(
+                RunStepKind::Observe,
+                format!("tool {tool_id} withheld: {reason}"),
+            );
+        }
+
+        let mut messages = vec![
+            Message::system(agent.instructions.clone()),
+            Message::user(message),
+        ];
+        let mut tool_calls_total = 0usize;
+
+        // Agent spend also counts toward its own scope (daily limit per agent lineage).
+        let budget_scope = format!("agent:{}", agent.lineage_id);
+
+        for turn in 1..=max_steps {
+            self.ensure_run_active(run, deadline).await?;
+            // Remaining run budget caps the next request's worst case *before* sending.
+            let remaining = match agent.budget.max_run_cost {
+                Some(max) if run.cost >= max => {
                     return Err(RouterError::BudgetExceeded(format!(
-                        "run cost {} exceeds max {max}",
+                        "run cost {} reached max_run_cost {max}",
                         run.cost
                     )));
                 }
-            }
+                Some(max) => Some(max - run.cost),
+                None => None,
+            };
 
             run.push_step(
                 RunStepKind::Llm,
-                format!("llm {} / {}", agent.model.provider, agent.model.model),
+                format!(
+                    "llm {} / {} (turn {turn})",
+                    agent.model.provider, agent.model.model
+                ),
             );
 
+            // Correlates every physical attempt (retries / fallbacks) of this turn.
+            let request_id = universal_ai::RequestId::new();
             let mut builder = ai
                 .chat()
+                .request_id(request_id)
                 .provider(agent.model.provider.clone())
                 .model(agent.model.model.clone())
-                .add_message(Message::system(agent.instructions.clone()))
-                .add_message(Message::user(message.clone()));
+                .messages(messages.iter().cloned())
+                .tools(toolset.tools().iter().cloned())
+                .budget_scope(budget_scope.clone(), agent.budget.max_daily_cost);
+            if let Some(remaining) = remaining {
+                builder = builder.max_cost(remaining);
+            }
             if let Some(t) = agent.model.temperature {
                 builder = builder.temperature(t);
             }
@@ -685,9 +684,36 @@ impl RouterRuntime {
                 builder = builder.max_tokens(m);
             }
 
-            let response = match builder.send().await {
+            // The run deadline cancels the in-flight request; cancellation settles the
+            // attempt (reservation kept) before returning, so its charge is visible.
+            let result = builder
+                .cancel_on(tokio::time::sleep_until(deadline))
+                .send()
+                .await;
+            let response = match result {
                 Ok(r) => r,
                 Err(err) => {
+                    // Failed attempts may still have been charged (timeouts, broken
+                    // responses, cancellation): count them toward the run.
+                    let charged = logical_charge(&ai, &request_id);
+                    if !charged.is_zero() {
+                        run.add_model_usage(RunUsage::default(), RunCost { amount: charged });
+                    }
+                    if matches!(err, universal_ai::AiError::Cancelled) {
+                        return Err(RouterError::Timeout);
+                    }
+                    if let Some(reason) = err.budget_reason() {
+                        if let Some(step) = run.steps.last_mut() {
+                            step.detail = Some(json!({
+                                "model": format!("{}/{}", agent.model.provider, agent.model.model),
+                                "turn": turn,
+                                "budget_decision": "rejected",
+                                "reason": reason,
+                                "remaining_run_budget": remaining,
+                                "error": err.to_string(),
+                            }));
+                        }
+                    }
                     let fail = Event::new(
                         "ai.request.failed",
                         "universal-ai",
@@ -697,71 +723,228 @@ impl RouterRuntime {
                             "run_id": run.id.to_string(),
                             "agent_id": agent.id.to_string(),
                             "error": err.to_string(),
+                            "budget_reason": err.budget_reason(),
                         }),
                     );
                     let _ = self.emit_bus_only(fail).await;
                     return Err(err.into());
                 }
             };
-            if let Some(usage) = response.usage() {
-                let cost = response
-                    .cost()
-                    .map(RunCost::from)
-                    .unwrap_or(RunCost {
-                        amount: Decimal::ZERO,
-                    });
-                run.add_model_usage(RunUsage::from(usage), cost.clone());
-                if let Some(step) = run.steps.last_mut() {
-                    step.cost = Some(cost.amount);
-                    step.detail = Some(json!({
-                        "model": format!("{}/{}", agent.model.provider, agent.model.model),
-                        "prompt_tokens": usage.prompt_tokens,
-                        "completion_tokens": usage.completion_tokens,
-                    }));
-                }
 
-                let completed = Event::new(
-                    "ai.request.completed",
-                    "universal-ai",
-                    json!({
-                        "provider": agent.model.provider,
-                        "model": agent.model.model,
-                        "run_id": run.id.to_string(),
-                        "agent_id": agent.id.to_string(),
-                        "prompt_tokens": usage.prompt_tokens,
-                        "completion_tokens": usage.completion_tokens,
-                        "total_tokens": usage.total_tokens,
-                        "cost": cost.amount.to_string(),
-                    }),
-                );
-                let _ = self.emit_bus_only(completed).await;
+            // Charged = actual cost when usage + pricing are known; otherwise the
+            // worst-case reservation (budget-controlled) — never a silent zero.
+            // Summed over every attempt of the turn (retries / fallbacks included).
+            let accounting = ai.request_usage(&response.request_id);
+            let charged = logical_charge(&ai, &request_id);
+            run.add_model_usage(
+                response.usage().map(RunUsage::from).unwrap_or_default(),
+                RunCost { amount: charged },
+            );
+
+            let requested: Vec<&str> = response.tool_calls().iter().map(|c| c.name()).collect();
+            if let Some(step) = run.steps.last_mut() {
+                let a = accounting.as_ref().map(|a| &a.accounting);
+                step.cost = Some(charged);
+                step.detail = Some(json!({
+                    "model": format!("{}/{}", agent.model.provider, agent.model.model),
+                    "turn": turn,
+                    "tool_calls": requested,
+                    "request_id": response.request_id.to_string(),
+                    "key_id": accounting.as_ref().and_then(|a| a.api_key.as_ref()).map(|k| k.to_string()),
+                    "prompt_tokens": response.usage().map(|u| u.prompt_tokens),
+                    "completion_tokens": response.usage().map(|u| u.completion_tokens),
+                    "budget_decision": if a.and_then(|a| a.estimated_cost).is_some() && remaining.is_some() { "admitted" } else { "not_limited_by_run" },
+                    "remaining_run_budget": remaining,
+                    "estimated_cost": a.and_then(|a| a.estimated_cost),
+                    "actual_cost": response.cost().map(|c| c.amount),
+                    "charged_cost": charged,
+                    "cost_status": a.map(|a| a.status),
+                }));
             }
 
+            let completed = Event::new(
+                "ai.request.completed",
+                "universal-ai",
+                json!({
+                    "provider": agent.model.provider,
+                    "model": agent.model.model,
+                    "run_id": run.id.to_string(),
+                    "agent_id": agent.id.to_string(),
+                    "prompt_tokens": response.usage().map(|u| u.prompt_tokens),
+                    "completion_tokens": response.usage().map(|u| u.completion_tokens),
+                    "total_tokens": response.usage().map(|u| u.total_tokens),
+                    "cost": charged.to_string(),
+                    "cost_status": accounting.as_ref().map(|a| a.accounting.status),
+                }),
+            );
+            let _ = self.emit_bus_only(completed).await;
+
+            // The gate admitted a worst case within the remaining budget; actual > estimate
+            // would mean the provider billed beyond max_tokens — stop the run.
             if let Some(max) = agent.budget.max_run_cost {
                 if run.cost > max {
                     return Err(RouterError::BudgetExceeded(format!(
-                        "actual cost {} exceeds max {max}",
+                        "actual cost {} exceeded max_run_cost {max} beyond the pre-flight estimate",
                         run.cost
                     )));
                 }
             }
 
-            let text = response.text();
-            run.push_step(RunStepKind::Result, "agent completed");
-            run.complete(json!({
-                "text": text,
-                "model": agent.model.model,
-                "provider": agent.model.provider,
-            }));
-            return Ok(());
+            let calls = response.tool_calls().to_vec();
+            if calls.is_empty() {
+                let text = response.text();
+                run.push_step(RunStepKind::Result, "agent completed");
+                run.complete(json!({
+                    "text": text,
+                    "model": agent.model.model,
+                    "provider": agent.model.provider,
+                    "turns": turn,
+                    "tool_calls": tool_calls_total,
+                }));
+                return Ok(());
+            }
+
+            // Every call gets a result so the conversation stays valid for the provider.
+            messages.push(response.message);
+            for (i, call) in calls.iter().enumerate() {
+                self.ensure_run_active(run, deadline).await?;
+                let result = if i >= MAX_TOOL_CALLS_PER_TURN {
+                    run.push_step(
+                        RunStepKind::Error,
+                        format!(
+                            "tool call {} skipped: per-turn tool call limit",
+                            call.name()
+                        ),
+                    );
+                    ToolResult::error(
+                        call.id.clone(),
+                        tool_error_payload(&format!(
+                            "too many tool calls in one turn (max {MAX_TOOL_CALLS_PER_TURN})"
+                        )),
+                    )
+                } else {
+                    tool_calls_total += 1;
+                    self.run_tool_call(agent, &toolset, call, run, deadline)
+                        .await?
+                };
+                messages.push(Message::tool_result(result));
+            }
         }
 
-        // Offline / stub mode without AiClient
-        run.push_step(RunStepKind::Observe, "no AiClient — stub response");
-        run.complete(json!({
-            "text": format!("[stub] processed: {message}"),
-            "stub": true,
-        }));
+        Err(RouterError::Policy(format!(
+            "agent did not produce a final answer within max_steps ({max_steps})"
+        )))
+    }
+
+    /// Execute one model-requested call. Policy / argument / tool failures become an
+    /// error tool result so the model can correct itself; only timeout aborts the run.
+    async fn run_tool_call(
+        &self,
+        agent: &Agent,
+        toolset: &AgentToolset,
+        call: &ToolCall,
+        run: &mut AgentRun,
+        deadline: tokio::time::Instant,
+    ) -> RouterResult<ToolResult> {
+        let Some(tool_id) = toolset.tool_id(call.name()) else {
+            run.push_step(
+                RunStepKind::Error,
+                format!(
+                    "tool call rejected: '{}' is not available to this agent",
+                    call.name()
+                ),
+            );
+            return Ok(ToolResult::error(
+                call.id.clone(),
+                tool_error_payload(&format!(
+                    "unknown tool '{}' — use one of the provided tools",
+                    call.name()
+                )),
+            ));
+        };
+
+        let input = match call.arguments_json() {
+            Ok(v) if v.is_object() => v,
+            Ok(_) => {
+                run.push_step(
+                    RunStepKind::Error,
+                    format!("tool {tool_id} invalid arguments: not a JSON object"),
+                );
+                return Ok(ToolResult::error(
+                    call.id.clone(),
+                    tool_error_payload("arguments must be a JSON object"),
+                ));
+            }
+            Err(err) => {
+                run.push_step(
+                    RunStepKind::Error,
+                    format!("tool {tool_id} invalid arguments: {err}"),
+                );
+                return Ok(ToolResult::error(
+                    call.id.clone(),
+                    tool_error_payload(&format!("arguments are not valid JSON: {err}")),
+                ));
+            }
+        };
+
+        run.push_step(RunStepKind::Tool, format!("tool {tool_id}"));
+        let started = Instant::now();
+        let outcome = tokio::time::timeout_at(
+            deadline,
+            self.tools.execute_for_agent(tool_id, input.clone(), agent),
+        )
+        .await
+        .map_err(|_| RouterError::Timeout)?;
+        let duration_ms = started.elapsed().as_millis() as u64;
+
+        let (result, detail) = match outcome {
+            Ok(output) => (
+                ToolResult::success(call.id.clone(), output.to_string()),
+                json!({ "output": output }),
+            ),
+            Err(err) => (
+                ToolResult::error(call.id.clone(), tool_error_payload(&err.to_string())),
+                json!({ "error": err.to_string() }),
+            ),
+        };
+        if let Some(step) = run.steps.last_mut() {
+            let mut d = json!({
+                "tool": tool_id,
+                "call_id": call.id,
+                "input": input,
+                "duration_ms": duration_ms,
+                "is_error": result.is_error,
+            });
+            if let (Some(d), Some(extra)) = (d.as_object_mut(), detail.as_object()) {
+                d.extend(extra.clone());
+            }
+            step.detail = Some(d);
+        }
+        if result.is_error {
+            run.push_step(
+                RunStepKind::Error,
+                format!(
+                    "tool {tool_id} failed: {}",
+                    detail["error"].as_str().unwrap_or("")
+                ),
+            );
+        } else {
+            run.push_step(RunStepKind::Observe, format!("tool {tool_id} ok"));
+        }
+        Ok(result)
+    }
+
+    async fn ensure_run_active(
+        &self,
+        run: &AgentRun,
+        deadline: tokio::time::Instant,
+    ) -> RouterResult<()> {
+        if self.is_cancelled(&run.id).await {
+            return Err(RouterError::Cancelled);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(RouterError::Timeout);
+        }
         Ok(())
     }
 
@@ -940,6 +1123,14 @@ impl RouterRuntime {
     }
 }
 
+/// Upper bound on tool calls executed from a single model response.
+const MAX_TOOL_CALLS_PER_TURN: usize = 16;
+
+/// Error content returned to the model as a tool result.
+fn tool_error_payload(message: &str) -> String {
+    json!({ "error": message }).to_string()
+}
+
 fn extract_user_message(input: &Value) -> String {
     input
         .get("message")
@@ -1010,6 +1201,14 @@ pub fn published_agent(name: &str, instructions: &str) -> Agent {
     a.status = AgentStatus::Published;
     a.tools = vec!["json.echo".into(), "web.search".into(), "event.emit".into()];
     a
+}
+
+/// What one logical model request (all its physical attempts) was charged.
+fn logical_charge(ai: &universal_ai::AiClient, request_id: &universal_ai::RequestId) -> Decimal {
+    ai.logical_request_attempts(request_id)
+        .iter()
+        .map(universal_ai::RequestUsage::budget_charge)
+        .sum()
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 description = "Universal AI provider SDK + account/key/cost runtime layer"
-readme = "../../README.md"
+readme = "README.md"
 keywords = ["ai", "llm", "openai", "anthropic", "sdk"]
 categories = ["api-bindings", "asynchronous"]
 
@@ -38,3 +38,7 @@ zeroize = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 wiremock = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[[bench]]
+name = "overhead"
+harness = false

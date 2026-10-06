@@ -2,7 +2,7 @@
 
 **Agent Runtime Platform** on top of **universal-ai** (model runtime).
 
-```
+```text
 Events → Handlers → Agents → Tools → Results → Events
                          ↓
                    universal-ai
@@ -79,6 +79,121 @@ async fn main() -> RouterResult<()> {
     Ok(())
 }
 ```
+
+## Agents with tools
+
+The agent loop is: model turn → tool calls → policy check → tool execution →
+tool results back to the model → next turn, until the model answers without
+tool calls. Limits: `limits.max_steps` (model turns per run) and
+`limits.max_runtime_seconds` (whole run, including each model request).
+
+Tools are offered **only** from the agent allow-list (`agent.tools`; empty = no
+tools), filtered by `agent.permissions` and the runtime deny list. Run input
+(webhooks, events) can never invoke tools directly. Tool failures, unknown
+tools and malformed arguments go back to the model as error tool results.
+
+```rust,no_run
+use std::sync::Arc;
+
+use routerai::*;
+use serde_json::{json, Value};
+use universal_ai::{AiClient, OpenAI};
+
+struct PriceLookup;
+
+#[async_trait::async_trait]
+impl ToolHandler for PriceLookup {
+    async fn call(&self, input: Value) -> RouterResult<Value> {
+        let sku = input["sku"].as_str().unwrap_or_default();
+        Ok(json!({ "sku": sku, "price_usd": 42 }))
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let ai = AiClient::builder()
+        .provider(OpenAI::new(std::env::var("OPENAI_API_KEY")?)?)
+        .build()?;
+    let rt = RouterRuntime::builder().ai(Arc::new(ai)).build().await?;
+
+    rt.tools()
+        .registry()
+        .register(
+            ToolDefinition {
+                id: "shop.price".into(),
+                name: "Price lookup".into(),
+                description: "Current price for a SKU".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": { "sku": { "type": "string" } },
+                    "required": ["sku"]
+                }),
+                output_schema: None,
+                permissions: Permissions::none(),
+            },
+            Arc::new(PriceLookup),
+        )
+        .await?;
+
+    let mut agent = published_agent("sales", "Answer price questions using tools.");
+    agent.model.provider = "openai".into();
+    agent.model.model = "gpt-4o-mini".into();
+    agent.tools = vec!["shop.price".into()];
+    agent.limits.max_steps = 6;
+    let agent_id = agent.id.clone();
+    rt.upsert_agent(agent).await?;
+
+    let run = rt
+        .start_run(&agent_id, json!({ "message": "How much is SKU-7?" }), None)
+        .await?;
+    println!("{:?}: {}", run.status, run.output.unwrap_or_default()["text"]);
+    Ok(())
+}
+```
+
+Without the runtime, `universal-ai` exposes the same flow on `ChatBuilder`:
+
+```rust,no_run
+use serde_json::json;
+use universal_ai::{AiClient, Message, OpenAI, Tool, ToolResult};
+
+# async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+let ai = AiClient::builder().provider(OpenAI::new("sk-...")?).build()?;
+let tools = vec![Tool::function(
+    "get_weather",
+    "Current weather for a city",
+    json!({ "type": "object", "properties": { "city": { "type": "string" } } }),
+)];
+
+let question = Message::user("Weather in Paris?");
+let first = ai
+    .chat()
+    .model("gpt-4o-mini")
+    .add_message(question.clone())
+    .tools(tools.clone())
+    .send()
+    .await?;
+
+let mut history = vec![question, first.message.clone()];
+for call in first.tool_calls() {
+    let args = call.arguments_json()?; // {"city": "Paris"}
+    let _ = args;
+    history.push(ToolResult::success(call.id.clone(), r#"{"temp_c":21}"#).into());
+}
+let answer = ai
+    .chat()
+    .model("gpt-4o-mini")
+    .messages(history)
+    .tools(tools)
+    .send()
+    .await?;
+println!("{}", answer.text());
+# Ok(())
+# }
+```
+
+Streaming (`.stream()`) does not assemble tool calls yet; agents use the
+non-streaming loop.
 
 ## Docs
 

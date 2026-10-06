@@ -41,7 +41,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/audit", get(list_audit))
         .route("/api/v1/providers", get(list_providers))
         .route("/api/v1/accounts", get(list_accounts).post(create_account))
-        .route("/api/v1/accounts/{id}/credit-budget", post(set_credit_budget))
+        .route(
+            "/api/v1/accounts/{id}/credit-budget",
+            post(set_credit_budget),
+        )
         .route("/api/v1/keys", get(list_keys).post(create_key))
         .route("/api/v1/keys/{id}", delete(delete_key))
         .route("/api/v1/balances", get(list_balances))
@@ -63,9 +66,15 @@ pub fn router(state: AppState) -> Router {
             "/api/v1/webhook-targets",
             get(list_webhook_targets).post(create_webhook_target),
         )
-        .route("/api/v1/webhook-targets/{id}", delete(delete_webhook_target))
+        .route(
+            "/api/v1/webhook-targets/{id}",
+            delete(delete_webhook_target),
+        )
         .route("/api/v1/handlers", post(upsert_handler).get(list_handlers))
-        .route("/api/v1/handlers/{id}", get(get_handler).delete(delete_handler))
+        .route(
+            "/api/v1/handlers/{id}",
+            get(get_handler).delete(delete_handler),
+        )
         .route("/api/v1/agents", post(create_agent).get(list_agents))
         .route(
             "/api/v1/agents/{id}",
@@ -88,7 +97,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/runs/{id}/cancel", post(cancel_run))
         .route("/api/v1/runs/{id}/retry", post(retry_run))
         .route("/api/v1/tools", get(list_tools))
-        .route("/api/v1/schedules", post(upsert_schedule).get(list_schedules))
+        .route(
+            "/api/v1/schedules",
+            post(upsert_schedule).get(list_schedules),
+        )
         .route("/api/v1/schedules/tick", post(tick_schedules))
         .route("/api/v1/test-cases", post(upsert_case).get(list_cases))
         .route("/api/v1/test-cases/{id}", delete(delete_case))
@@ -208,10 +220,12 @@ async fn set_credit_budget(
     let ai = require_ai(&state)?;
     let budget = match body.credit_budget.as_deref() {
         None | Some("") => None,
-        Some(s) => Some(
-            s.parse::<rust_decimal::Decimal>()
-                .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, format!("invalid budget: {e}")))?,
-        ),
+        Some(s) => Some(s.parse::<rust_decimal::Decimal>().map_err(|e| {
+            (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("invalid budget: {e}"),
+            )
+        })?),
     };
     let account = ai
         .accounts()
@@ -255,15 +269,10 @@ async fn get_ai_request(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
     let ai = require_ai(&state)?;
-    let request_id = id
-        .parse::<RequestId>()
-        .map_err(map_ai_err)?;
+    let request_id = id.parse::<RequestId>().map_err(map_ai_err)?;
     match ai.get_ai_request(&request_id).await.map_err(map_ai_err)? {
         Some(row) => Ok(Json(serde_json::to_value(row).unwrap())),
-        None => Err((
-            axum::http::StatusCode::NOT_FOUND,
-            format!("request {id}"),
-        )),
+        None => Err((axum::http::StatusCode::NOT_FOUND, format!("request {id}"))),
     }
 }
 
@@ -357,12 +366,10 @@ async fn delete_key(
     ai.keys().remove_key(&key_id).await.map_err(map_ai_err)?;
     if let Some(info) = info {
         // Drop provider only if no other active key remains for it.
-        let still = ai
-            .keys()
-            .list_keys()
-            .await
-            .into_iter()
-            .any(|k| k.provider == info.provider && k.status == universal_ai::KeyStatus::Active);
+        let still =
+            ai.keys().list_keys().await.into_iter().any(|k| {
+                k.provider == info.provider && k.status == universal_ai::KeyStatus::Active
+            });
         if !still {
             ai.unregister_provider(&info.provider);
         }
@@ -379,9 +386,13 @@ fn map_ai_err(err: universal_ai::AiError) -> (axum::http::StatusCode, String) {
         AiError::InvalidRequest { .. }
         | AiError::UnsupportedModel { .. }
         | AiError::Config { .. } => StatusCode::BAD_REQUEST,
-        AiError::BudgetExceeded { .. } | AiError::InsufficientBalance { .. } => {
-            StatusCode::PAYMENT_REQUIRED
-        }
+        AiError::BudgetExceeded { .. }
+        | AiError::DailyLimitExceeded { .. }
+        | AiError::MonthlyLimitExceeded { .. }
+        | AiError::PricingUnavailable { .. }
+        | AiError::OutputLimitUnknown { .. }
+        | AiError::UsageUnavailable { .. }
+        | AiError::InsufficientBalance { .. } => StatusCode::PAYMENT_REQUIRED,
         AiError::Authentication { .. } | AiError::Authorization { .. } => StatusCode::UNAUTHORIZED,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
@@ -393,8 +404,10 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    header_str(headers, "authorization")
-        .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
+    header_str(headers, "authorization").and_then(|v| {
+        v.strip_prefix("Bearer ")
+            .or_else(|| v.strip_prefix("bearer "))
+    })
 }
 
 async fn webhook_ingress_default(
@@ -562,7 +575,12 @@ async fn get_handler(
         .get(&HandlerId::from_string(id))
         .await
         .map(Json)
-        .ok_or_else(|| (axum::http::StatusCode::NOT_FOUND, "handler not found".into()))
+        .ok_or_else(|| {
+            (
+                axum::http::StatusCode::NOT_FOUND,
+                "handler not found".into(),
+            )
+        })
 }
 
 async fn delete_handler(
@@ -884,7 +902,12 @@ async fn playground(
 async fn list_runs(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
-    let runs = state.runtime.store().list_runs(100).await.map_err(map_err)?;
+    let runs = state
+        .runtime
+        .store()
+        .list_runs(100)
+        .await
+        .map_err(map_err)?;
     Ok(Json(serde_json::json!({ "runs": runs })))
 }
 
@@ -973,10 +996,7 @@ struct CaseQuery {
     agent_id: Option<String>,
 }
 
-async fn list_cases(
-    State(state): State<AppState>,
-    Query(q): Query<CaseQuery>,
-) -> Json<Value> {
+async fn list_cases(State(state): State<AppState>, Query(q): Query<CaseQuery>) -> Json<Value> {
     let agent = q.agent_id.map(AgentId::from_string);
     let cases = state.runtime.tests().list_cases(agent.as_ref()).await;
     Json(serde_json::json!({ "cases": cases }))
@@ -986,11 +1006,7 @@ async fn delete_case(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
-    state
-        .runtime
-        .delete_test_case(&id)
-        .await
-        .map_err(map_err)?;
+    state.runtime.delete_test_case(&id).await.map_err(map_err)?;
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
 
@@ -1005,7 +1021,9 @@ async fn run_case(
         .await
         .ok_or_else(|| (axum::http::StatusCode::NOT_FOUND, "case not found".into()))?;
     let (run, report) = state.runtime.run_test(&case).await.map_err(map_err)?;
-    Ok(Json(serde_json::json!({ "run": run, "evaluation": report })))
+    Ok(Json(
+        serde_json::json!({ "run": run, "evaluation": report }),
+    ))
 }
 
 async fn upsert_dataset(
@@ -1013,11 +1031,7 @@ async fn upsert_dataset(
     Json(ds): Json<Dataset>,
 ) -> Result<Json<Dataset>, (axum::http::StatusCode, String)> {
     Ok(Json(
-        state
-            .runtime
-            .upsert_dataset(ds)
-            .await
-            .map_err(map_err)?,
+        state.runtime.upsert_dataset(ds).await.map_err(map_err)?,
     ))
 }
 

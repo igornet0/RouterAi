@@ -9,10 +9,10 @@ use std::str::FromStr;
 use crate::account::{Account, AccountStatus};
 use crate::balance::Balance;
 use crate::cost::Cost;
-use crate::error::{AiError, AiResult};
+use crate::error::{sanitize_message, AiError, AiResult};
 use crate::storage::Storage;
 use crate::types::{AccountId, Currency, KeyId, ModelId, ProviderId, RequestId};
-use crate::usage::{validate_importance, RequestUsage, Usage};
+use crate::usage::{validate_importance, CostAccounting, RequestUsage, Usage};
 
 /// SQLite-backed storage.
 #[derive(Clone)]
@@ -36,6 +36,19 @@ impl SqliteStorage {
     }
 
     async fn migrate(&self) -> AiResult<()> {
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(storage_err)?;
+        if version > SCHEMA_VERSION {
+            // Fail closed: an older binary must not reinterpret (and possibly
+            // undercount) rows written by a newer schema.
+            return Err(AiError::Storage {
+                message: format!(
+                    "database schema version {version} is newer than supported {SCHEMA_VERSION}"
+                ),
+            });
+        }
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS accounts (
@@ -77,15 +90,34 @@ impl SqliteStorage {
         )
         .execute(&self.pool)
         .await
-        .map_err(|e| AiError::Storage {
-            message: e.to_string(),
-        })?;
+        .map_err(storage_err)?;
 
-        // Existing DBs created before content columns.
+        // Additive, idempotent column migrations (v0 → v2). Old rows keep NULLs,
+        // which read back as "unknown" — never as a zero charge.
         for sql in [
+            // v1: content columns.
             "ALTER TABLE requests ADD COLUMN request_json TEXT NOT NULL DEFAULT '{}'",
             "ALTER TABLE requests ADD COLUMN response_json TEXT",
             "ALTER TABLE requests ADD COLUMN importance INTEGER",
+            // v1: budget accounting (one row per physical attempt).
+            "ALTER TABLE requests ADD COLUMN cost_status TEXT",
+            "ALTER TABLE requests ADD COLUMN estimated_cost TEXT",
+            "ALTER TABLE requests ADD COLUMN charged_cost TEXT",
+            "ALTER TABLE requests ADD COLUMN budget_scope TEXT",
+            "ALTER TABLE requests ADD COLUMN logical_request_id TEXT",
+            "ALTER TABLE requests ADD COLUMN attempt INTEGER",
+            "ALTER TABLE requests ADD COLUMN rejection TEXT",
+            // v2: per-attempt reservation, typed usage, cost breakdown.
+            "ALTER TABLE requests ADD COLUMN reserved_cost TEXT",
+            "ALTER TABLE requests ADD COLUMN retry INTEGER",
+            "ALTER TABLE requests ADD COLUMN dispatched INTEGER",
+            "ALTER TABLE requests ADD COLUMN cost_note TEXT",
+            "ALTER TABLE requests ADD COLUMN error_kind TEXT",
+            "ALTER TABLE requests ADD COLUMN cached_tokens INTEGER",
+            "ALTER TABLE requests ADD COLUMN cache_creation_tokens INTEGER",
+            "ALTER TABLE requests ADD COLUMN reasoning_tokens INTEGER",
+            "ALTER TABLE requests ADD COLUMN other_tokens TEXT",
+            "ALTER TABLE requests ADD COLUMN cost_json TEXT",
         ] {
             if let Err(e) = sqlx::query(sql).execute(&self.pool).await {
                 let msg = e.to_string();
@@ -94,70 +126,139 @@ impl SqliteStorage {
                 }
             }
         }
+        for sql in [
+            "CREATE INDEX IF NOT EXISTS idx_requests_started_at ON requests(started_at)",
+            "CREATE INDEX IF NOT EXISTS idx_requests_cost_status ON requests(cost_status)",
+        ] {
+            sqlx::query(sql)
+                .execute(&self.pool)
+                .await
+                .map_err(storage_err)?;
+        }
+        sqlx::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+            .execute(&self.pool)
+            .await
+            .map_err(storage_err)?;
         Ok(())
     }
 
+    /// Switch the database to write-ahead logging (persistent for the file).
+    /// Commits stay durable (`synchronous` remains FULL) but need one fsync
+    /// instead of several: ~4–5× lower reservation / settlement latency in
+    /// `benches/overhead.rs`. Not for databases on network filesystems.
+    pub async fn enable_wal(&self) -> AiResult<()> {
+        let mode: String = sqlx::query_scalar("PRAGMA journal_mode=WAL")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(storage_err)?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            return Err(AiError::Storage {
+                message: format!("could not enable WAL (journal_mode={mode})"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Schema version recorded in the database (`PRAGMA user_version`).
+    pub async fn schema_version(&self) -> AiResult<i64> {
+        sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(storage_err)
+    }
+
     fn map_request_row(row: &sqlx::sqlite::SqliteRow) -> RequestUsage {
-        let request_id = RequestId::from_str(row.get::<String, _>("request_id").as_str())
-            .unwrap_or_default();
-        let cost_amount: Option<String> = row.try_get("cost_amount").ok();
-        let request_json_raw: String = row
-            .try_get("request_json")
-            .unwrap_or_else(|_| "{}".into());
-        let response_json_raw: Option<String> = row.try_get("response_json").ok().flatten();
-        let importance: Option<i64> = row.try_get("importance").ok().flatten();
+        let request_id =
+            RequestId::from_str(row.get::<String, _>("request_id").as_str()).unwrap_or_default();
+        let text = |col: &str| -> Option<String> { row.try_get(col).ok().flatten() };
+        let int = |col: &str| -> Option<i64> { row.try_get(col).ok().flatten() };
+        let decimal = |col: &str| text(col).and_then(|s| s.parse::<Decimal>().ok());
+        let accounting = CostAccounting {
+            status: text("cost_status")
+                .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok())
+                .unwrap_or_default(),
+            estimated_cost: decimal("estimated_cost"),
+            reserved_cost: decimal("reserved_cost"),
+            charged_cost: decimal("charged_cost"),
+            budget_scope: text("budget_scope"),
+            logical_request_id: text("logical_request_id")
+                .and_then(|s| RequestId::from_str(&s).ok()),
+            attempt: int("attempt").unwrap_or(0) as u32,
+            retry: int("retry").unwrap_or(0) as u32,
+            dispatched: int("dispatched").unwrap_or(0) != 0,
+            rejection: text("rejection"),
+            cost_note: text("cost_note"),
+            error_kind: text("error_kind")
+                .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok()),
+        };
+        // Full breakdown when present; legacy rows only stored the total.
+        let cost = text("cost_json")
+            .and_then(|s| serde_json::from_str::<Cost>(&s).ok())
+            .or_else(|| {
+                decimal("cost_amount").map(|amount| Cost {
+                    amount,
+                    ..Cost::zero()
+                })
+            });
+        let parse_time = |col: &str| {
+            chrono::DateTime::parse_from_rfc3339(row.get::<String, _>(col).as_str())
+                .map(|d| d.with_timezone(&chrono::Utc))
+                .unwrap_or_else(|_| chrono::Utc::now())
+        };
         RequestUsage {
             request_id,
             provider: ProviderId::new(row.get::<String, _>("provider")),
             account: AccountId::new(row.get::<String, _>("account")),
-            api_key: row
-                .try_get::<Option<String>, _>("api_key")
-                .ok()
-                .flatten()
-                .map(KeyId::new),
+            api_key: text("api_key").map(KeyId::new),
             model: ModelId::new(row.get::<String, _>("model")),
-            started_at: chrono::DateTime::parse_from_rfc3339(row.get::<String, _>("started_at").as_str())
-                .map(|d| d.with_timezone(&chrono::Utc))
-                .unwrap_or_else(|_| chrono::Utc::now()),
-            finished_at: chrono::DateTime::parse_from_rfc3339(
-                row.get::<String, _>("finished_at").as_str(),
-            )
-            .map(|d| d.with_timezone(&chrono::Utc))
-            .unwrap_or_else(|_| chrono::Utc::now()),
+            started_at: parse_time("started_at"),
+            finished_at: parse_time("finished_at"),
             usage: Usage {
                 prompt_tokens: row.get::<i64, _>("prompt_tokens") as u64,
                 completion_tokens: row.get::<i64, _>("completion_tokens") as u64,
                 total_tokens: row.get::<i64, _>("total_tokens") as u64,
-                cached_tokens: None,
-                reasoning_tokens: None,
+                cached_tokens: int("cached_tokens").map(|v| v as u64),
+                cache_creation_tokens: int("cache_creation_tokens").map(|v| v as u64),
+                reasoning_tokens: int("reasoning_tokens").map(|v| v as u64),
+                other_tokens: text("other_tokens")
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default(),
             },
-            cost: cost_amount.and_then(|s| {
-                s.parse::<Decimal>().ok().map(|amount| Cost {
-                    currency: Currency::usd(),
-                    amount,
-                    input_cost: Decimal::ZERO,
-                    output_cost: Decimal::ZERO,
-                    cache_cost: Decimal::ZERO,
-                })
-            }),
+            cost,
             success: row.get::<i64, _>("success") != 0,
             latency_ms: row.get::<i64, _>("latency_ms") as u64,
-            request_json: serde_json::from_str(&request_json_raw)
-                .unwrap_or_else(|_| serde_json::json!({})),
-            response_json: response_json_raw.and_then(|s| serde_json::from_str(&s).ok()),
-            importance: importance.map(|v| v as u8),
+            request_json: text("request_json")
+                .and_then(|s| serde_json::from_str(&s).ok())
+                .unwrap_or_else(|| serde_json::json!({})),
+            response_json: text("response_json").and_then(|s| serde_json::from_str(&s).ok()),
+            importance: int("importance").map(|v| v as u8),
+            accounting,
         }
     }
+}
+
+/// Current schema version (`PRAGMA user_version`).
+pub const SCHEMA_VERSION: i64 = 2;
+
+fn storage_err(e: sqlx::Error) -> AiError {
+    AiError::Storage {
+        message: sanitize_message(&e.to_string()),
+    }
+}
+
+fn enum_text<T: serde::Serialize>(v: &T) -> Option<String> {
+    serde_json::to_value(v)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
 }
 
 #[async_trait]
 impl Storage for SqliteStorage {
     async fn save_request(&self, row: &RequestUsage) -> AiResult<()> {
-        let request_json = serde_json::to_string(&row.request_json).map_err(|e| {
-            AiError::Serialization {
+        let request_json =
+            serde_json::to_string(&row.request_json).map_err(|e| AiError::Serialization {
                 message: e.to_string(),
-            }
-        })?;
+            })?;
         let response_json = row
             .response_json
             .as_ref()
@@ -166,13 +267,33 @@ impl Storage for SqliteStorage {
             .map_err(|e| AiError::Serialization {
                 message: e.to_string(),
             })?;
+        let other_tokens = (!row.usage.other_tokens.is_empty())
+            .then(|| serde_json::to_string(&row.usage.other_tokens))
+            .transpose()
+            .map_err(|e| AiError::Serialization {
+                message: e.to_string(),
+            })?;
+        let cost_json = row
+            .cost
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| AiError::Serialization {
+                message: e.to_string(),
+            })?;
+        let a = &row.accounting;
         sqlx::query(
             r#"
             INSERT OR REPLACE INTO requests
             (request_id, provider, account, api_key, model, started_at, finished_at,
              prompt_tokens, completion_tokens, total_tokens, cost_amount, success, latency_ms,
-             request_json, response_json, importance)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             request_json, response_json, importance,
+             cost_status, estimated_cost, charged_cost, budget_scope, logical_request_id,
+             attempt, rejection,
+             reserved_cost, retry, dispatched, cost_note, error_kind,
+             cached_tokens, cache_creation_tokens, reasoning_tokens, other_tokens, cost_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(row.request_id.to_string())
@@ -191,11 +312,26 @@ impl Storage for SqliteStorage {
         .bind(request_json)
         .bind(response_json)
         .bind(row.importance.map(|v| v as i64))
+        .bind(enum_text(&a.status))
+        .bind(a.estimated_cost.map(|d| d.to_string()))
+        .bind(a.charged_cost.map(|d| d.to_string()))
+        .bind(a.budget_scope.clone())
+        .bind(a.logical_request_id.map(|id| id.to_string()))
+        .bind(a.attempt as i64)
+        .bind(a.rejection.clone())
+        .bind(a.reserved_cost.map(|d| d.to_string()))
+        .bind(a.retry as i64)
+        .bind(a.dispatched as i64)
+        .bind(a.cost_note.clone())
+        .bind(a.error_kind.as_ref().and_then(enum_text))
+        .bind(row.usage.cached_tokens.map(|v| v as i64))
+        .bind(row.usage.cache_creation_tokens.map(|v| v as i64))
+        .bind(row.usage.reasoning_tokens.map(|v| v as i64))
+        .bind(other_tokens)
+        .bind(cost_json)
         .execute(&self.pool)
         .await
-        .map_err(|e| AiError::Storage {
-            message: e.to_string(),
-        })?;
+        .map_err(storage_err)?;
         Ok(())
     }
 
@@ -215,9 +351,8 @@ impl Storage for SqliteStorage {
         id: &RequestId,
         importance: Option<u8>,
     ) -> AiResult<RequestUsage> {
-        let importance = validate_importance(importance).map_err(|message| {
-            AiError::InvalidRequest { message }
-        })?;
+        let importance = validate_importance(importance)
+            .map_err(|message| AiError::InvalidRequest { message })?;
         let result = sqlx::query("UPDATE requests SET importance = ? WHERE request_id = ?")
             .bind(importance.map(|v| v as i64))
             .bind(id.to_string())
@@ -293,6 +428,81 @@ impl Storage for SqliteStorage {
             })?;
 
         Ok(rows.iter().map(Self::map_request_row).collect())
+    }
+
+    async fn spend_in_window(
+        &self,
+        scope: Option<&str>,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+    ) -> AiResult<Decimal> {
+        // `started_at` is RFC 3339 text: prefilter by date prefix in SQL, then compare
+        // parsed timestamps exactly; sum as Decimal (SQL SUM would go through floats).
+        let rows = sqlx::query(
+            "SELECT started_at, charged_cost, cost_amount, budget_scope FROM requests \
+             WHERE started_at >= ? AND (? IS NULL OR budget_scope = ?)",
+        )
+        .bind(start.format("%Y-%m-%d").to_string())
+        .bind(scope)
+        .bind(scope)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AiError::Storage {
+            message: e.to_string(),
+        })?;
+        let mut total = Decimal::ZERO;
+        for row in rows {
+            let Ok(at) =
+                chrono::DateTime::parse_from_rfc3339(row.get::<String, _>("started_at").as_str())
+            else {
+                continue;
+            };
+            let at = at.with_timezone(&chrono::Utc);
+            if at < start || at >= end {
+                continue;
+            }
+            let amount = |col: &str| -> Option<Decimal> {
+                row.try_get::<Option<String>, _>(col)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| s.parse().ok())
+            };
+            total += amount("charged_cost")
+                .or_else(|| amount("cost_amount"))
+                .unwrap_or(Decimal::ZERO);
+        }
+        Ok(total)
+    }
+
+    async fn abandon_pending(&self, before: chrono::DateTime<chrono::Utc>) -> AiResult<u64> {
+        let rows = sqlx::query(
+            "SELECT request_id, started_at FROM requests WHERE cost_status = 'pending'",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(storage_err)?;
+        let mut n = 0;
+        for row in rows {
+            let started =
+                chrono::DateTime::parse_from_rfc3339(row.get::<String, _>("started_at").as_str())
+                    .map(|d| d.with_timezone(&chrono::Utc));
+            // Unparseable timestamps are left pending (still charged).
+            let Ok(started) = started else { continue };
+            if started >= before {
+                continue;
+            }
+            n += sqlx::query(
+                "UPDATE requests SET cost_status = 'abandoned', cost_note = ? \
+                 WHERE request_id = ? AND cost_status = 'pending'",
+            )
+            .bind("orphaned reservation recovered after restart; charge kept")
+            .bind(row.get::<String, _>("request_id"))
+            .execute(&self.pool)
+            .await
+            .map_err(storage_err)?
+            .rows_affected();
+        }
+        Ok(n)
     }
 
     async fn list_balances(&self) -> AiResult<Vec<Balance>> {

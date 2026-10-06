@@ -38,7 +38,9 @@ async fn event_handler_agent_chain_stub() {
     assert_eq!(runs[0].status, RunStatus::Completed);
 
     let events = rt.events().list(20).await;
-    assert!(events.iter().any(|e| e.event_type == "telegram.message.received"));
+    assert!(events
+        .iter()
+        .any(|e| e.event_type == "telegram.message.received"));
     assert!(events.iter().any(|e| e.event_type == "agent.completed"));
 }
 
@@ -100,6 +102,17 @@ async fn agent_run_with_universal_ai_mock() {
         .with_example_prices()
         .build()
         .unwrap();
+    // max_run_cost makes the run budget-controlled: the model needs a known price.
+    ai.pricing().upsert(universal_ai::ModelPricing {
+        provider: universal_ai::ProviderId::openai_compatible(),
+        model: universal_ai::ModelId::new("custom-model"),
+        input_per_million: Some(Decimal::new(1, 0)),
+        output_per_million: Some(Decimal::new(2, 0)),
+        cached_input_per_million: None,
+        cache_write_per_million: None,
+        reasoning_per_million: None,
+        effective_from: chrono::Utc::now(),
+    });
 
     let rt = RouterRuntime::builder()
         .ai(std::sync::Arc::new(ai))
@@ -126,15 +139,11 @@ async fn agent_run_with_universal_ai_mock() {
     let text = run.output.as_ref().unwrap()["text"].as_str().unwrap();
     assert!(text.contains("Цена") || text.contains("цена") || text.contains("$42"));
     assert!(run.usage.total_tokens > 0);
+    // 20 input × $1/M + 8 output × $2/M
+    assert_eq!(run.cost, Decimal::new(36, 6));
     assert!(!run.steps.is_empty());
 
-    let case = text_case(
-        "price",
-        agent_id,
-        "Сколько стоит?",
-        &["Цена"],
-        &["не знаю"],
-    );
+    let case = text_case("price", agent_id, "Сколько стоит?", &["Цена"], &["не знаю"]);
     // Re-run test against same agent (will call mock again)
     let (_run2, report) = rt.run_test(&case).await.unwrap();
     // Case-sensitive must_contain "Цена" — mock returns "Цена продукта $42"
@@ -199,7 +208,8 @@ async fn sqlite_hydrates_console_state_after_restart() {
         event_id = ev.id.clone();
         rt.emit(ev).await.unwrap();
 
-        let mut target = SinkTarget::new("https://example.com/hook", vec!["agent.completed".into()]);
+        let mut target =
+            SinkTarget::new("https://example.com/hook", vec!["agent.completed".into()]);
         sink_id = target.id.clone();
         target = rt.upsert_sink_target(target).await.unwrap();
         assert_eq!(target.id, sink_id);

@@ -5,13 +5,14 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::budget::worst_case_cost;
 use crate::capability::Capability;
 use crate::cost::CostManager;
 use crate::error::{AiError, AiResult};
 use crate::health::HealthMonitor;
 use crate::models::ModelRegistry;
 use crate::provider::DynProvider;
-use crate::types::{ChatRequest, ChatResponse, ModelId, ProviderId};
+use crate::types::{ChatRequest, ModelId, ProviderId};
 
 /// High-level task class for routing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,47 +115,24 @@ impl Router {
         self
     }
 
-    /// Pick provider+model and execute chat.
-    pub async fn execute<F, Fut>(self, request: ChatRequest, send: F) -> AiResult<ChatResponse>
-    where
-        F: Fn(DynProvider, ChatRequest) -> Fut,
-        Fut: std::future::Future<Output = AiResult<ChatResponse>>,
-    {
-        let candidates = self.candidates_for(&request).await?;
-        let mut last_err = None;
-        for (provider, model) in candidates {
-            let mut req = request.clone();
-            req.model = model;
-            match send(provider, req).await {
-                Ok(resp) => return Ok(resp),
-                Err(err) => {
-                    if !err.is_retryable() && !matches!(err, AiError::NoAvailableProvider { .. }) {
-                        // auth / invalid — try next provider only for availability-class errors
-                        if matches!(
-                            err,
-                            AiError::Network { .. }
-                                | AiError::Timeout
-                                | AiError::RateLimit { .. }
-                                | AiError::Provider { .. }
-                        ) {
-                            last_err = Some(err);
-                            continue;
-                        }
-                        return Err(err);
-                    }
-                    last_err = Some(err);
-                }
-            }
-        }
-        Err(last_err.unwrap_or_else(|| AiError::NoAvailableProvider {
-            message: "no provider matched routing policy".into(),
-        }))
+    /// Routing decision for `request`: eligible `(provider, model)` pairs in
+    /// order. The router never sends anything — execute the request with
+    /// [`crate::AiClient::chat`] (e.g. `.provider(id)`), so every attempt passes the
+    /// budget gate and is accounted.
+    ///
+    /// With a cost cap ([`Router::budget`] / [`Router::max_cost`]) a provider is
+    /// only eligible when the request's worst case is known and fits: unknown
+    /// pricing or an unbounded output excludes it (fail-closed).
+    pub async fn select(&self, request: &ChatRequest) -> AiResult<Vec<(ProviderId, ModelId)>> {
+        Ok(self
+            .candidates_for(request)
+            .await?
+            .into_iter()
+            .map(|(p, m)| (p.id(), m))
+            .collect())
     }
 
-    async fn candidates_for(
-        &self,
-        request: &ChatRequest,
-    ) -> AiResult<Vec<(DynProvider, ModelId)>> {
+    async fn candidates_for(&self, request: &ChatRequest) -> AiResult<Vec<(DynProvider, ModelId)>> {
         let needed = match self.task.unwrap_or(TaskType::TextGeneration) {
             TaskType::TextGeneration => Capability::Chat,
             TaskType::Embeddings => Capability::Embeddings,
@@ -164,13 +142,7 @@ impl Router {
 
         let mut out = Vec::new();
         for provider in &self.providers {
-            if !provider.supports(needed) && needed != Capability::Chat {
-                // chat is baseline for text generation
-                if needed != Capability::Chat {
-                    continue;
-                }
-            }
-            if needed == Capability::Chat && !provider.supports(Capability::Chat) {
+            if !provider.supports(needed) {
                 continue;
             }
             if !self.health.is_healthy(&provider.id()).await {
@@ -185,28 +157,13 @@ impl Router {
                     }
                 }
             }
-
-            let model = if self.models.get(request.model.as_str()).is_some() {
-                request.model.clone()
-            } else {
-                // keep requested model id; provider will validate
-                request.model.clone()
-            };
-
             if let Some(max) = self.max_cost {
-                if let Ok(Some(est)) = self.cost.estimate(
-                    &provider.id(),
-                    &model,
-                    1_000,
-                    request.max_tokens.map(|t| t as u64),
-                ) {
-                    if est.total > max {
-                        continue;
-                    }
+                match worst_case_cost(&self.cost, &self.models, &provider.id(), request) {
+                    Ok(est) if est.total <= max => {}
+                    _ => continue,
                 }
             }
-
-            out.push((Arc::clone(provider), model));
+            out.push((Arc::clone(provider), request.model.clone()));
         }
 
         if out.is_empty() {

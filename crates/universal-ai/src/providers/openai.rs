@@ -16,7 +16,7 @@ use crate::error::{AiError, AiResult};
 use crate::health::HealthStatus;
 use crate::http::HttpClient;
 use crate::models::ModelInfo;
-use crate::provider::Provider;
+use crate::provider::{DynProvider, Provider, ProviderCredential};
 use crate::providers::openai_compatible::OpenAICompatible;
 use crate::types::{ChatRequest, ChatResponse, ChatStream, ProviderId};
 use crate::usage::{Usage, UsageReport, UsageRequest};
@@ -35,6 +35,19 @@ impl OpenAI {
 
     /// Create with shared HTTP client.
     pub fn with_http(api_key: impl Into<SecretString>, http: HttpClient) -> AiResult<Self> {
+        Self::create(Some(api_key.into()), None, http)
+    }
+
+    /// Keyless template for managed keys (bound per request).
+    pub(crate) fn template(base_url: Option<&str>, http: HttpClient) -> AiResult<Self> {
+        Self::create(None, base_url, http)
+    }
+
+    fn create(
+        api_key: Option<SecretString>,
+        base_url: Option<&str>,
+        http: HttpClient,
+    ) -> AiResult<Self> {
         let mut caps = ProviderCapabilities::openai_compatible_chat();
         caps.images = true;
         caps.audio = true;
@@ -46,14 +59,17 @@ impl OpenAI {
         caps.usage = true;
         // No prepaid balance for project/user API keys; see `balance()`.
         caps.balance = false;
-        let inner = OpenAICompatible::builder()
-            .base_url("https://api.openai.com/v1")
-            .api_key(api_key)
+        let mut builder = OpenAICompatible::builder()
+            .base_url(base_url.unwrap_or("https://api.openai.com/v1"))
             .provider_id(ProviderId::openai())
             .capabilities(caps)
-            .http(http)
-            .build()?;
-        Ok(Self { inner })
+            .http(http);
+        if let Some(key) = api_key {
+            builder = builder.api_key(key);
+        }
+        Ok(Self {
+            inner: builder.build_unauthenticated()?,
+        })
     }
 
     /// Test helper with custom base URL.
@@ -94,7 +110,7 @@ impl OpenAI {
                 &ProviderId::openai(),
                 Method::GET,
                 &url,
-                Some(&self.inner.api_key),
+                Some(self.inner.credential()?),
                 &[],
                 None::<&()>,
             )
@@ -201,6 +217,12 @@ impl Provider for OpenAI {
             Err(err) => Ok(HealthStatus::down(err.to_string())),
         }
     }
+
+    fn with_credential(&self, credential: &ProviderCredential) -> AiResult<DynProvider> {
+        Ok(Arc::new(Self {
+            inner: self.inner.bound(credential),
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -218,6 +240,9 @@ mod tests {
                 ]
             }]
         });
-        assert_eq!(sum_openai_costs(&raw), Decimal::from_str("3.750000").unwrap());
+        assert_eq!(
+            sum_openai_costs(&raw),
+            Decimal::from_str("3.750000").unwrap()
+        );
     }
 }

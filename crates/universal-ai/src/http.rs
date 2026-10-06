@@ -118,12 +118,15 @@ impl HttpClient {
             req = req.json(b);
         }
 
-        let response = req.send().await.map_err(|e| {
-            let retryable = e.is_timeout() || e.is_connect() || e.is_request();
-            AiError::network(e, retryable)
-        })?;
-
-        Self::parse_json_response(provider, response, self.config.max_response_bytes).await
+        let result = async {
+            let response = req.send().await.map_err(transport_error)?;
+            Self::parse_json_response(provider, response, self.config.max_response_bytes).await
+        }
+        .await;
+        match bearer {
+            Some(token) => result.map_err(|e| e.redact_secret(token)),
+            None => result,
+        }
     }
 
     /// Send and return raw Response (for SSE).
@@ -146,8 +149,11 @@ impl HttpClient {
             req = req.json(b);
         }
         req.send().await.map_err(|e| {
-            let retryable = e.is_timeout() || e.is_connect() || e.is_request();
-            AiError::network(e, retryable)
+            let err = transport_error(e);
+            match bearer {
+                Some(token) => err.redact_secret(token),
+                None => err,
+            }
         })
     }
 
@@ -165,7 +171,8 @@ impl HttpClient {
             .and_then(|v| v.to_str().ok())
             .map(str::to_string);
 
-        let bytes = response.bytes().await.map_err(|e| AiError::network(e, true))?;
+        let retry_after = retry_after_secs(response.headers());
+        let bytes = response.bytes().await.map_err(transport_error)?;
         if bytes.len() > max_bytes {
             return Err(AiError::Provider {
                 details: crate::error::ProviderErrorDetails {
@@ -182,11 +189,9 @@ impl HttpClient {
 
         if !status.is_success() {
             let body = String::from_utf8_lossy(&bytes);
-            return Err(AiError::from_http_status(
-                provider.clone(),
-                status.as_u16(),
-                &body,
-                request_id,
+            return Err(with_retry_after(
+                AiError::from_http_status(provider.clone(), status.as_u16(), &body, request_id),
+                retry_after,
             ));
         }
 
@@ -208,5 +213,84 @@ impl HttpClient {
                 None,
             ))
         }
+    }
+}
+
+/// Typed transport error: deadline → [`AiError::Timeout`]; connect / send / body
+/// failures → retryable [`AiError::Network`]. Messages are sanitized.
+pub(crate) fn transport_error(e: reqwest::Error) -> AiError {
+    if e.is_timeout() {
+        return AiError::Timeout;
+    }
+    let retryable = e.is_connect() || e.is_request() || e.is_body();
+    AiError::network(e, retryable)
+}
+
+/// Typed error for a non-success response: status class, sanitized body,
+/// upstream request id and `Retry-After` hint.
+pub(crate) async fn error_from_response(provider: &ProviderId, response: Response) -> AiError {
+    let status = response.status().as_u16();
+    let retry_after = retry_after_secs(response.headers());
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .or_else(|| response.headers().get("request-id"))
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let body = response.text().await.unwrap_or_default();
+    with_retry_after(
+        AiError::from_http_status(provider.clone(), status, &body, request_id),
+        retry_after,
+    )
+}
+
+/// `Retry-After` as seconds (delta-seconds or HTTP-date).
+fn retry_after_secs(headers: &HeaderMap) -> Option<u64> {
+    let value = headers.get("retry-after")?.to_str().ok()?.trim();
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(secs);
+    }
+    let at = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    Some((at.timestamp() - chrono::Utc::now().timestamp()).max(0) as u64)
+}
+
+fn with_retry_after(err: AiError, secs: Option<u64>) -> AiError {
+    match (err, secs) {
+        (
+            AiError::RateLimit {
+                provider, message, ..
+            },
+            Some(s),
+        ) => AiError::RateLimit {
+            provider,
+            retry_after_secs: Some(s),
+            message,
+        },
+        (AiError::Provider { mut details }, Some(s)) => {
+            details.retry_after_secs = Some(s);
+            AiError::Provider { details }
+        }
+        (err, _) => err,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::HeaderValue;
+
+    #[test]
+    fn parses_retry_after_seconds_and_dates() {
+        let mut h = HeaderMap::new();
+        h.insert("retry-after", HeaderValue::from_static("7"));
+        assert_eq!(retry_after_secs(&h), Some(7));
+        let soon = (chrono::Utc::now() + chrono::Duration::seconds(30)).to_rfc2822();
+        h.insert("retry-after", HeaderValue::from_str(&soon).unwrap());
+        assert!(matches!(retry_after_secs(&h), Some(28..=30)));
+        let err = with_retry_after(
+            AiError::from_http_status(ProviderId::openai(), 429, "slow down", None),
+            Some(3),
+        );
+        assert_eq!(err.retry_after_secs(), Some(3));
     }
 }

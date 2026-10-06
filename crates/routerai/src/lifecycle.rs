@@ -149,12 +149,31 @@ pub async fn validate_publish(
         },
     });
 
+    // Same rule the runtime enforces: an agent may only call tools whose required
+    // permissions it has been granted.
+    let mut ungranted: Vec<String> = tools
+        .iter()
+        .filter(|t| agent.tools.contains(&t.id))
+        .flat_map(|t| {
+            t.permissions
+                .allow
+                .iter()
+                .filter(|p| !agent.permissions.allows(**p))
+                .map(move |p| format!("{} needs {p:?}", t.id))
+        })
+        .collect();
+    ungranted.sort();
+    let permissions_ok = ungranted.is_empty();
     checks.push(ValidationCheck {
         id: "permissions".into(),
         label: "Permissions".into(),
-        passed: true,
+        passed: permissions_ok,
         blocking: true,
-        message: format!("{} allow flag(s)", agent.permissions.allow.len()),
+        message: if permissions_ok {
+            format!("{} allow flag(s)", agent.permissions.allow.len())
+        } else {
+            format!("missing permissions: {}", ungranted.join(", "))
+        },
     });
 
     let budget_ok = agent.limits.max_steps > 0 && agent.limits.max_runtime_seconds > 0;
@@ -305,5 +324,39 @@ mod tests {
             .blocking_failures()
             .iter()
             .any(|c| c.id == "config.instructions"));
+    }
+
+    #[tokio::test]
+    async fn validation_requires_tool_permissions() {
+        let reg = ToolRegistry::new();
+        BuiltinTools::register_all(&reg).await.unwrap();
+        let mut agent = Agent::new("x", "search things");
+        agent.tools = vec!["web.search".into()];
+        let ctx = || PublishContext {
+            tool_registry: &reg,
+            ai_configured: true,
+            kill_switch: false,
+            runtime_ok: true,
+            regression_passed: None,
+            test_case_count: 0,
+        };
+
+        let report = validate_publish(&agent, ctx()).await.unwrap();
+        let check = report
+            .blocking_failures()
+            .into_iter()
+            .find(|c| c.id == "permissions")
+            .expect("missing Network permission must block publish");
+        assert!(check.message.contains("web.search needs Network"));
+
+        agent
+            .permissions
+            .allow
+            .insert(crate::tool::Permission::Network);
+        let report = validate_publish(&agent, ctx()).await.unwrap();
+        assert!(!report
+            .blocking_failures()
+            .iter()
+            .any(|c| c.id == "permissions"));
     }
 }

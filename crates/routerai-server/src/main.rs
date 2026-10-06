@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ai = build_ai_client(&data).await?;
     tracing::info!(
         data_dir = %data.display(),
-        providers = ai.providers().len(),
+        providers = ai.provider_summaries().len(),
         "AiClient ready"
     );
 
@@ -106,9 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn build_app(api: Router, web_dir: Option<&std::path::Path>) -> Router {
     if let Some(dir) = web_dir {
         let index = dir.join("index.html");
-        return api.fallback_service(
-            ServeDir::new(dir).not_found_service(ServeFile::new(index)),
-        );
+        return api.fallback_service(ServeDir::new(dir).not_found_service(ServeFile::new(index)));
     }
     api.fallback(get(static_files::static_handler))
 }

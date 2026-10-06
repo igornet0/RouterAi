@@ -87,7 +87,7 @@
     "maxSteps": "Макс. шагов",
     "maxRuntime": "Макс. время (сек)",
     "maxRunCost": "Макс. стоимость запуска (USD)",
-    "permissionsHint": "Права инструментов проверяет Tool Executor (shell / fs-write по умолчанию запрещены). Allow-list агента: {{tools}}.",
+    "permissionsHint": "Агент может вызывать только инструменты из allow-list, для которых выданы все нужные права (shell / fs-write запрещены runtime по умолчанию). Allow-list агента: {{tools}}.",
     "none": "(нет)",
     "lifecycleFlow": "DRAFT → TESTING → READY → PUBLISHED → PAUSED → ARCHIVED",
     "markTesting": "Пометить testing",
