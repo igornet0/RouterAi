@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::pricing::{apply_price_sheet, PriceSheet};
 use universal_ai::{
     Account, AiClient, ApiKeyInfo, EncryptedFileSecretStore, KeyStatus, SecretStoreKey,
     SqliteStorage,
@@ -106,9 +107,11 @@ pub async fn persist_from_client(ai: &AiClient, path: &Path) -> Result<(), Strin
 }
 
 /// Build AiClient with the encrypted secret store (migrating a legacy obfuscated
-/// store) and restore providers from persisted keys.
+/// store), the operator's price sheet (never demo prices), and restore providers
+/// from persisted keys.
 pub async fn build_ai_client(
     dir: &Path,
+    prices: &PriceSheet,
     secrets_key: &SecretStoreKey,
 ) -> Result<Arc<AiClient>, Box<dyn std::error::Error>> {
     tokio::fs::create_dir_all(dir).await?;
@@ -126,9 +129,9 @@ pub async fn build_ai_client(
             .allow_empty_providers()
             .secret_store(secret_store)
             .storage(storage)
-            .with_example_prices()
             .build()?,
     );
+    apply_price_sheet(&ai, prices)?;
 
     let creds = load_credentials(&credentials_path(dir)).await;
     ai.accounts().replace_all(creds.accounts).await;
@@ -158,7 +161,7 @@ pub async fn build_ai_client(
 mod tests {
     use super::*;
     use secrecy::ExposeSecret;
-    use universal_ai::{KeyId, SecretStore, SecretString};
+    use universal_ai::{KeyId, ModelId, ProviderId, SecretStore, SecretString};
 
     const CREDENTIAL: &str = "TEST-CREDENTIAL-PLAINTEXT-SERVER-0123456789";
 
@@ -168,10 +171,10 @@ mod tests {
 
     /// Start-up on a data directory written by an older server: the obfuscated
     /// store is migrated into the encrypted one and deleted, no plaintext key is
-    /// left on disk, and secret files are owner-only.
+    /// left on disk, secret files are owner-only, and no demo price is loaded.
     #[tokio::test]
     #[allow(deprecated)]
-    async fn startup_migrates_secrets() {
+    async fn startup_migrates_secrets_and_loads_no_demo_prices() {
         let dir = std::env::temp_dir().join(format!("routerai-server-{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&dir).await.unwrap();
         {
@@ -187,7 +190,9 @@ mod tests {
         let key = SecretStoreKey::load_or_create(default_secrets_key_path(&dir))
             .await
             .unwrap();
-        let ai = build_ai_client(&dir, &key).await.unwrap();
+        let ai = build_ai_client(&dir, &PriceSheet::default(), &key)
+            .await
+            .unwrap();
 
         let secret = ai
             .keys()
@@ -215,6 +220,17 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "{}", path.display());
+        }
+
+        // Demo prices never reach the server's registry.
+        for (provider, model) in [
+            (ProviderId::deepseek(), "deepseek-chat"),
+            (ProviderId::openai(), "gpt-4o-mini"),
+        ] {
+            assert!(ai
+                .pricing()
+                .get_price_sync(&provider, &ModelId::new(model))
+                .is_none());
         }
     }
 }

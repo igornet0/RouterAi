@@ -37,13 +37,35 @@ cd web && npm install && npm run build   # refresh Console before cargo rebuild
 cd web && npm run dev                    # hot reload at :5173 (proxies API)
 ```
 
-### Server configuration: secrets
+### Server configuration: prices and secrets
 
 | Setting | Default | Meaning |
 |---|---|---|
 | `ROUTERAI_DATA_DIR` / `--data-dir` | `~/.routerai` | databases, key metadata, encrypted secrets |
+| `ROUTERAI_PRICING_FILE` / `--pricing-file` | `<data dir>/pricing.toml` | price sheet (see below); a model without an entry is refused before any request (`PricingUnavailable`) |
 | `ROUTERAI_SECRETS_KEY` | — | 64 hex chars: AES-256-GCM key of `<data dir>/secrets.enc` |
 | `ROUTERAI_SECRETS_KEY_FILE` | `<data dir>/secrets.key` (created, `0600`, with a warning) | key file used when `ROUTERAI_SECRETS_KEY` is unset; keep it **outside** the data directory in production |
+
+The server never loads built-in or demo prices. Every rate comes from the price
+sheet with its source and verification date (`GET /api/v1/pricing` lists them):
+
+```toml
+[[price]]
+provider = "openai"
+model = "gpt-4o-mini"
+input_per_million = "0.15"          # USD, strings (exact decimals)
+output_per_million = "0.60"
+cached_input_per_million = "0.075"  # optional; also cache_write_ / reasoning_per_million
+source = "https://openai.com/api/pricing"
+as_of = "2026-10-01"                # last verified; entries older than 90 days are logged
+```
+
+Unknown keys, float or negative rates, missing `source` / `as_of`, future dates
+and duplicate entries stop the server at startup. A self-hosted model is free
+only if its entry says `"0"`. Agent requests are always cost-bounded: without a
+price — or without `max_tokens` / a known model output limit — they are refused
+before sending, and an attempt whose cost cannot be determined is charged its
+reservation, never `$0`.
 
 Secrets are stored in `secrets.enc` (AES-256-GCM, owner-only). A legacy
 `secrets.bin` (XOR-obfuscated, written by older versions) is imported and deleted

@@ -2,6 +2,7 @@
 
 mod api;
 mod credentials;
+mod pricing;
 mod static_files;
 
 use std::net::SocketAddr;
@@ -43,6 +44,11 @@ struct Args {
     /// Directory for secrets + credentials metadata (`ROUTERAI_DATA_DIR`).
     #[arg(long, env = "ROUTERAI_DATA_DIR")]
     data_dir: Option<PathBuf>,
+
+    /// Price sheet (default `<data dir>/pricing.toml`). Models without an entry
+    /// are refused before any request is sent.
+    #[arg(long, env = "ROUTERAI_PRICING_FILE")]
+    pricing_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -60,8 +66,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let data = args.data_dir.unwrap_or_else(data_dir);
     tokio::fs::create_dir_all(&data).await?;
+    let pricing_path = args
+        .pricing_file
+        .clone()
+        .unwrap_or_else(|| pricing::default_pricing_path(&data));
+    let prices = pricing::load_price_sheet(&pricing_path).await?;
     let secrets_key = credentials::secret_store_key(&data).await?;
-    let ai = build_ai_client(&data, &secrets_key).await?;
+    let ai = build_ai_client(&data, &prices, &secrets_key).await?;
     tracing::info!(
         data_dir = %data.display(),
         providers = ai.provider_summaries().len(),
@@ -91,6 +102,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         runtime,
         webhook_secret,
         credentials_path: credentials::credentials_path(&data),
+        prices: Arc::new(prices),
     };
 
     let api = api::router(state);

@@ -22,6 +22,7 @@ use universal_ai::{
 };
 
 use crate::credentials::persist_from_client;
+use crate::pricing::PriceSheet;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -30,12 +31,15 @@ pub struct AppState {
     pub webhook_secret: Option<String>,
     /// Path to credentials.json for account/key metadata.
     pub credentials_path: PathBuf,
+    /// Price sheet in effect (rates with source and verification date).
+    pub prices: Arc<PriceSheet>,
 }
 
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/v1/doctor", get(doctor))
+        .route("/api/v1/pricing", get(list_pricing))
         .route("/api/v1/dashboard", get(dashboard))
         .route("/api/v1/settings/kill-switch", get(get_kill).post(set_kill))
         .route("/api/v1/audit", get(list_audit))
@@ -113,6 +117,10 @@ pub fn router(state: AppState) -> Router {
 
 async fn health() -> Json<Value> {
     Json(serde_json::json!({ "ok": true, "service": "routerai" }))
+}
+
+async fn list_pricing(State(state): State<AppState>) -> Json<Value> {
+    Json(serde_json::json!({ "prices": state.prices.prices }))
 }
 
 async fn doctor(State(state): State<AppState>) -> Json<Value> {
