@@ -17,7 +17,7 @@ use crate::health::HealthStatus;
 use crate::http::HttpClient;
 use crate::models::ModelInfo;
 use crate::provider::{DynProvider, Provider, ProviderCredential};
-use crate::providers::openai_compatible::OpenAICompatible;
+use crate::providers::openai_compatible::{OpenAICompatible, OutputLimitParam};
 use crate::types::{ChatRequest, ChatResponse, ChatStream, ProviderId};
 use crate::usage::{Usage, UsageReport, UsageRequest};
 
@@ -63,6 +63,7 @@ impl OpenAI {
             .base_url(base_url.unwrap_or("https://api.openai.com/v1"))
             .provider_id(ProviderId::openai())
             .capabilities(caps)
+            .output_limit_param(OutputLimitParam::MaxCompletionTokens)
             .http(http);
         if let Some(key) = api_key {
             builder = builder.api_key(key);
@@ -85,6 +86,7 @@ impl OpenAI {
             .api_key(api_key)
             .provider_id(ProviderId::openai())
             .capabilities(caps)
+            .output_limit_param(OutputLimitParam::MaxCompletionTokens)
             .http(http)
             .build()?;
         Ok(Self { inner })

@@ -13,15 +13,19 @@
 //! ```
 //!
 //! Settlement methods take the meter by value and `Drop` settles a meter that was
-//! never settled, so an attempt is settled exactly once. A crash before settlement
-//! leaves the persisted `Pending` row charged at its reservation.
+//! never settled, so an attempt is settled exactly once. The settlement itself
+//! runs on its own task, so cancelling the caller mid-settlement cannot interrupt
+//! it. A crash before settlement leaves the persisted `Pending` row charged at its
+//! reservation.
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use futures::StreamExt;
 use rust_decimal::Decimal;
+use tracing::Instrument;
 
 use crate::account::ApiKeyManager;
 use crate::budget::SpendLedger;
@@ -29,7 +33,7 @@ use crate::cost::CostManager;
 use crate::error::AiError;
 use crate::events::{AiEvent, EventBus, RequestCompleted};
 use crate::telemetry::{AttemptReport, TelemetrySink};
-use crate::types::{ChatResponse, ChatStream, ModelId, StreamEvent};
+use crate::types::{ChatResponse, ChatStream, ModelId, ProviderId, StreamEvent};
 use crate::usage::{CostStatus, RequestUsage, Usage, UsageManager};
 
 /// Shared services needed to settle attempts (also from spawned tasks).
@@ -42,18 +46,81 @@ pub(crate) struct Core {
     pub telemetry: Arc<dyn TelemetrySink>,
     /// Persist prompt / response content in request rows.
     pub store_content: bool,
+    /// Models whose worst case was falsified by a bill above the reserved token
+    /// bounds (see [`AiError::WorstCaseUnbounded`]).
+    pub unbounded: Mutex<HashSet<(ProviderId, ModelId)>>,
 }
 
 impl Core {
-    /// Persist the final row, move the ledger from `reserved` to the final charge,
-    /// attribute it to its key, and report it. Never fails: if persisting fails the
-    /// reservation stays charged (in memory and in the persisted `Pending` row).
+    /// Whether an attempt on `provider` / `model` was billed beyond its reserved
+    /// token bounds: its worst case can no longer be trusted.
+    pub(crate) fn is_unbounded(&self, provider: &ProviderId, model: &ModelId) -> bool {
+        self.unbounded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&(provider.clone(), model.clone()))
+    }
+
+    /// Fail closed when a budget-controlled attempt was billed more tokens than
+    /// its reservation assumed possible (input above the byte bound, output above
+    /// `max_tokens`): the actual cost is still charged, and the model is marked so
+    /// that further budget-controlled requests to it are refused before dispatch.
+    fn check_bounds(&self, s: &MeterState) {
+        if !s.controlled {
+            return;
+        }
+        let u = &s.row.usage;
+        let input_over = u.prompt_tokens > s.input_bound;
+        let output_over = s.output_bound.is_some_and(|b| u.completion_tokens > b);
+        if !input_over && !output_over {
+            return;
+        }
+        tracing::error!(
+            request_id = %s.row.request_id,
+            provider = %s.row.provider,
+            model = %s.requested_model,
+            input_tokens = u.prompt_tokens,
+            input_bound = s.input_bound,
+            output_tokens = u.completion_tokens,
+            output_bound = ?s.output_bound,
+            reserved_cost = %s.reserved,
+            charged_cost = ?s.row.accounting.charged_cost,
+            "provider billed more tokens than the reserved worst case; \
+             budget-controlled requests to this model are refused from now on"
+        );
+        self.unbounded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((s.row.provider.clone(), s.requested_model.clone()));
+    }
+
+    /// [`Core::finish_now`] on its own task, awaited: the result is visible when
+    /// this returns, but dropping the caller (aborted task, client disconnect,
+    /// outer timeout, dropped stream) cannot interrupt a settlement half-way and
+    /// leave the attempt `Pending` or missing from the statistics.
     pub(crate) async fn finish(
-        &self,
+        self: &Arc<Self>,
         reserved: Decimal,
         row: RequestUsage,
         ttft: Option<Duration>,
     ) {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                let core = Arc::clone(self);
+                let task = handle.spawn(
+                    async move { core.finish_now(reserved, row, ttft).await }
+                        .instrument(tracing::Span::current()),
+                );
+                let _ = task.await;
+            }
+            Err(_) => self.finish_now(reserved, row, ttft).await,
+        }
+    }
+
+    /// Persist the final row, move the ledger from `reserved` to the final charge,
+    /// attribute it to its key, and report it. Never fails: if persisting fails the
+    /// reservation stays charged (in memory and in the persisted `Pending` row).
+    async fn finish_now(&self, reserved: Decimal, row: RequestUsage, ttft: Option<Duration>) {
         if let Err(err) = self.ledger.settle(reserved, &row).await {
             tracing::error!(
                 request_id = %row.request_id,
@@ -159,6 +226,10 @@ struct MeterState {
     reserved: Decimal,
     controlled: bool,
     started: Instant,
+    /// Input token bound the reservation assumed.
+    input_bound: u64,
+    /// Output token bound the reservation assumed (sent as `max_tokens` when
+    /// budget-controlled).
     output_bound: Option<u64>,
     phase: AttemptPhase,
     usage: Option<Usage>,
@@ -179,7 +250,7 @@ impl AttemptMeter {
         reserved: Decimal,
         controlled: bool,
         started: Instant,
-        output_bound: Option<u64>,
+        (input_bound, output_bound): (u64, Option<u64>),
     ) -> Self {
         Self {
             core,
@@ -189,6 +260,7 @@ impl AttemptMeter {
                 reserved,
                 controlled,
                 started,
+                input_bound,
                 output_bound,
                 phase: AttemptPhase::Reserved,
                 usage: None,
@@ -228,6 +300,7 @@ impl AttemptMeter {
                 response_model: &response.model,
             },
         );
+        self.core.check_bounds(&s);
         response.cost = s.row.cost.clone();
         let status = s.row.accounting.status;
         self.emit_completed(&s);
@@ -247,6 +320,7 @@ impl AttemptMeter {
     pub(crate) async fn settle_abandoned(mut self) {
         if let Some(mut s) = self.state.take() {
             settle_row(&mut s, &self.core.cost, Outcome::Abandoned);
+            self.core.check_bounds(&s);
             self.core.finish(s.reserved, s.row, s.first_token).await;
         }
     }
@@ -293,6 +367,7 @@ impl AttemptMeter {
             &self.core.cost,
             Outcome::StreamEnded { completed, failure },
         );
+        self.core.check_bounds(&s);
         let status = s.row.accounting.status;
         if s.row.success {
             self.emit_completed(&s);
@@ -329,6 +404,7 @@ impl Drop for AttemptMeter {
             return;
         };
         settle_row(&mut s, &self.core.cost, Outcome::Abandoned);
+        self.core.check_bounds(&s);
         tracing::warn!(
             request_id = %s.row.request_id,
             provider = %s.row.provider,
@@ -339,7 +415,7 @@ impl Drop for AttemptMeter {
             Ok(handle) => {
                 let core = Arc::clone(&self.core);
                 handle.spawn(async move {
-                    core.finish(s.reserved, s.row, s.first_token).await;
+                    core.finish_now(s.reserved, s.row, s.first_token).await;
                 });
             }
             // No runtime (dropped during shutdown): the persisted `Pending` row
@@ -473,16 +549,6 @@ fn price_into(
     });
     match priced {
         Ok(c) => {
-            if let Some(bound) = s.output_bound {
-                if usage.completion_tokens > bound {
-                    tracing::error!(
-                        request_id = %s.row.request_id,
-                        output_tokens = usage.completion_tokens,
-                        output_bound = bound,
-                        "provider billed more output tokens than the reserved bound"
-                    );
-                }
-            }
             s.row.accounting.status = known_status;
             s.row.accounting.charged_cost = Some(c.amount);
             s.row.accounting.cost_note = None;
@@ -601,6 +667,7 @@ mod tests {
             },
             controlled,
             started: Instant::now(),
+            input_bound: 18,
             output_bound: Some(100),
             phase: AttemptPhase::Dispatched,
             usage: None,

@@ -22,6 +22,29 @@ use crate::types::{
 };
 use crate::usage::Usage;
 
+/// Wire parameter that carries [`ChatRequest::max_tokens`] — the output bound,
+/// reasoning tokens included.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum OutputLimitParam {
+    /// `max_tokens`: what OpenAI-compatible servers (and DeepSeek, OpenRouter)
+    /// accept.
+    #[default]
+    MaxTokens,
+    /// `max_completion_tokens`: OpenAI's bound on visible **and** reasoning output
+    /// tokens. OpenAI reasoning models reject `max_tokens`.
+    MaxCompletionTokens,
+}
+
+impl OutputLimitParam {
+    fn field(self) -> &'static str {
+        match self {
+            Self::MaxTokens => "max_tokens",
+            Self::MaxCompletionTokens => "max_completion_tokens",
+        }
+    }
+}
+
 /// Builder for a generic OpenAI-compatible endpoint.
 #[derive(Clone)]
 pub struct OpenAICompatibleBuilder {
@@ -31,6 +54,7 @@ pub struct OpenAICompatibleBuilder {
     capabilities: ProviderCapabilities,
     http: Option<HttpClient>,
     extra_headers: Vec<(String, String)>,
+    output_limit: OutputLimitParam,
 }
 
 impl std::fmt::Debug for OpenAICompatibleBuilder {
@@ -54,6 +78,7 @@ impl OpenAICompatibleBuilder {
             capabilities: ProviderCapabilities::openai_compatible_chat(),
             http: None,
             extra_headers: Vec::new(),
+            output_limit: OutputLimitParam::MaxTokens,
         }
     }
 
@@ -84,6 +109,12 @@ impl OpenAICompatibleBuilder {
     /// Shared HTTP client.
     pub fn http(mut self, http: HttpClient) -> Self {
         self.http = Some(http);
+        self
+    }
+
+    /// Wire parameter for the output bound (default `max_tokens`).
+    pub fn output_limit_param(mut self, param: OutputLimitParam) -> Self {
+        self.output_limit = param;
         self
     }
 
@@ -121,6 +152,7 @@ impl OpenAICompatibleBuilder {
             capabilities: self.capabilities,
             http: Arc::new(http),
             extra_headers: self.extra_headers,
+            output_limit: self.output_limit,
         })
     }
 }
@@ -142,6 +174,7 @@ pub struct OpenAICompatible {
     pub(crate) capabilities: ProviderCapabilities,
     pub(crate) http: Arc<HttpClient>,
     pub(crate) extra_headers: Vec<(String, String)>,
+    pub(crate) output_limit: OutputLimitParam,
 }
 
 impl std::fmt::Debug for OpenAICompatible {
@@ -221,7 +254,7 @@ impl OpenAICompatible {
             .collect()
     }
 
-    pub(crate) fn wire_body(request: &ChatRequest, stream: bool) -> Value {
+    pub(crate) fn wire_body(&self, request: &ChatRequest, stream: bool) -> Value {
         let mut body = json!({
             "model": request.model.as_str(),
             "messages": Self::wire_messages(&request.messages),
@@ -235,7 +268,7 @@ impl OpenAICompatible {
             body["temperature"] = json!(t);
         }
         if let Some(m) = request.max_tokens {
-            body["max_tokens"] = json!(m);
+            body[self.output_limit.field()] = json!(m);
         }
         if let Some(p) = request.top_p {
             body["top_p"] = json!(p);
@@ -370,8 +403,13 @@ pub(crate) fn parse_wire_usage(u: &Value) -> Option<Usage> {
     Some(usage)
 }
 
-/// Events carried by one OpenAI-style SSE chunk.
-fn parse_stream_chunk(v: &Value, provider: &ProviderId) -> Vec<AiResult<StreamEvent>> {
+/// Events carried by one OpenAI-style SSE chunk. `finished` records that a
+/// choice has reported its `finish_reason` (state across chunks).
+fn parse_stream_chunk(
+    v: &Value,
+    provider: &ProviderId,
+    finished: &mut bool,
+) -> Vec<AiResult<StreamEvent>> {
     let mut out = Vec::new();
     if let Some(err) = v.get("error").filter(|e| !e.is_null()) {
         let message = err
@@ -392,15 +430,28 @@ fn parse_stream_chunk(v: &Value, provider: &ProviderId) -> Vec<AiResult<StreamEv
         }));
         return out;
     }
-    // Non-final chunks carry `"usage": null` when include_usage is on.
-    if let Some(usage) = v.get("usage").and_then(parse_wire_usage) {
-        out.push(Ok(StreamEvent::Usage { usage }));
-    }
-    let Some(choice) = v
+    let choice = v
         .get("choices")
         .and_then(|c| c.as_array())
-        .and_then(|a| a.first())
-    else {
+        .and_then(|a| a.first());
+    if choice
+        .and_then(|c| c.get("finish_reason"))
+        .is_some_and(|f| !f.is_null())
+    {
+        *finished = true;
+    }
+    // Non-final chunks carry `"usage": null` when include_usage is on. Usage is
+    // final only once generation finished: OpenAI sends it in a chunk without
+    // choices, others attach it to the finishing chunk. Usage on a chunk of an
+    // unfinished choice is a running count (continuous usage stats); forwarding
+    // it would let a dropped stream be charged that partial count instead of its
+    // reservation.
+    if choice.is_none() || *finished {
+        if let Some(usage) = v.get("usage").and_then(parse_wire_usage) {
+            out.push(Ok(StreamEvent::Usage { usage }));
+        }
+    }
+    let Some(choice) = choice else {
         return out;
     };
     if let Some(delta) = choice.get("delta") {
@@ -553,7 +604,7 @@ impl Provider for OpenAICompatible {
 
     async fn chat(&self, request: ChatRequest) -> AiResult<ChatResponse> {
         let request_id = RequestId::new();
-        let body = Self::wire_body(&request, false);
+        let body = self.wire_body(&request, false);
         let (raw, _rate, _): (Value, _, _) = self
             .http
             .request_json(
@@ -569,7 +620,7 @@ impl Provider for OpenAICompatible {
     }
 
     async fn stream_chat(&self, request: ChatRequest) -> AiResult<ChatStream> {
-        let body = Self::wire_body(&request, true);
+        let body = self.wire_body(&request, true);
         let response = self
             .http
             .send_raw(
@@ -588,13 +639,13 @@ impl Provider for OpenAICompatible {
         }
 
         let provider = self.provider_id.clone();
-        Ok(sse_stream(response, (), move |_, event| {
+        Ok(sse_stream(response, false, move |finished, event| {
             if event.data.trim() == "[DONE]" {
                 return (vec![Ok(StreamEvent::Done)], true);
             }
             match sse_json(event) {
                 Ok(v) => {
-                    let events = parse_stream_chunk(&v, &provider);
+                    let events = parse_stream_chunk(&v, &provider, finished);
                     let failed = events.iter().any(Result::is_err);
                     (events, failed)
                 }

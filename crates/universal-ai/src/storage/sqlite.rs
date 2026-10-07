@@ -2,15 +2,18 @@
 
 use async_trait::async_trait;
 use rust_decimal::Decimal;
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnection, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
+use std::collections::HashMap;
 use std::str::FromStr;
+
+use chrono::{DateTime, Datelike, Utc};
 
 use crate::account::{Account, AccountStatus};
 use crate::balance::Balance;
 use crate::cost::Cost;
 use crate::error::{sanitize_message, AiError, AiResult};
-use crate::storage::Storage;
+use crate::storage::{SpendLimits, Storage};
 use crate::types::{AccountId, Currency, KeyId, ModelId, ProviderId, RequestId};
 use crate::usage::{validate_importance, CostAccounting, RequestUsage, Usage};
 
@@ -129,17 +132,51 @@ impl SqliteStorage {
         for sql in [
             "CREATE INDEX IF NOT EXISTS idx_requests_started_at ON requests(started_at)",
             "CREATE INDEX IF NOT EXISTS idx_requests_cost_status ON requests(cost_status)",
+            "CREATE INDEX IF NOT EXISTS idx_requests_logical ON requests(logical_request_id)",
         ] {
             sqlx::query(sql)
                 .execute(&self.pool)
                 .await
                 .map_err(storage_err)?;
         }
-        sqlx::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
-            .execute(&self.pool)
+        // v3: running spend totals, maintained in the same transaction as every
+        // row write. Built once from the rows, under the write lock, so concurrent
+        // openers cannot build them twice.
+        let mut tx = self.begin_immediate().await?;
+        let version: i64 = sqlx::query_scalar("PRAGMA user_version")
+            .fetch_one(&mut *tx)
             .await
             .map_err(storage_err)?;
-        Ok(())
+        if version > SCHEMA_VERSION {
+            return Err(AiError::Storage {
+                message: format!(
+                    "database schema version {version} is newer than supported {SCHEMA_VERSION}"
+                ),
+            });
+        }
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS spend_totals (bucket TEXT PRIMARY KEY, amount TEXT NOT NULL)",
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(storage_err)?;
+        if version < 3 {
+            rebuild_totals(&mut tx).await?;
+        }
+        sqlx::query(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))
+            .execute(&mut *tx)
+            .await
+            .map_err(storage_err)?;
+        tx.commit().await.map_err(storage_err)
+    }
+
+    /// Write transaction that takes SQLite's write lock up front: reads inside it
+    /// see the state the write is based on (no lost update between processes).
+    async fn begin_immediate(&self) -> AiResult<sqlx::Transaction<'static, sqlx::Sqlite>> {
+        self.pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(storage_err)
     }
 
     /// Switch the database to write-ahead logging (persistent for the file).
@@ -238,7 +275,7 @@ impl SqliteStorage {
 }
 
 /// Current schema version (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 fn storage_err(e: sqlx::Error) -> AiError {
     AiError::Storage {
@@ -252,87 +289,300 @@ fn enum_text<T: serde::Serialize>(v: &T) -> Option<String> {
         .and_then(|v| v.as_str().map(str::to_string))
 }
 
+/// `INSERT OR REPLACE` of one attempt row (no totals bookkeeping).
+async fn upsert_row(conn: &mut SqliteConnection, row: &RequestUsage) -> AiResult<()> {
+    let request_json =
+        serde_json::to_string(&row.request_json).map_err(|e| AiError::Serialization {
+            message: e.to_string(),
+        })?;
+    let response_json = row
+        .response_json
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| AiError::Serialization {
+            message: e.to_string(),
+        })?;
+    let other_tokens = (!row.usage.other_tokens.is_empty())
+        .then(|| serde_json::to_string(&row.usage.other_tokens))
+        .transpose()
+        .map_err(|e| AiError::Serialization {
+            message: e.to_string(),
+        })?;
+    let cost_json = row
+        .cost
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| AiError::Serialization {
+            message: e.to_string(),
+        })?;
+    let a = &row.accounting;
+    sqlx::query(
+        r#"
+        INSERT OR REPLACE INTO requests
+        (request_id, provider, account, api_key, model, started_at, finished_at,
+         prompt_tokens, completion_tokens, total_tokens, cost_amount, success, latency_ms,
+         request_json, response_json, importance,
+         cost_status, estimated_cost, charged_cost, budget_scope, logical_request_id,
+         attempt, rejection,
+         reserved_cost, retry, dispatched, cost_note, error_kind,
+         cached_tokens, cache_creation_tokens, reasoning_tokens, other_tokens, cost_json)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(row.request_id.to_string())
+    .bind(row.provider.to_string())
+    .bind(row.account.to_string())
+    .bind(row.api_key.as_ref().map(|k| k.to_string()))
+    .bind(row.model.to_string())
+    .bind(row.started_at.to_rfc3339())
+    .bind(row.finished_at.to_rfc3339())
+    .bind(row.usage.prompt_tokens as i64)
+    .bind(row.usage.completion_tokens as i64)
+    .bind(row.usage.total_tokens as i64)
+    .bind(row.cost.as_ref().map(|c| c.amount.to_string()))
+    .bind(row.success as i64)
+    .bind(row.latency_ms as i64)
+    .bind(request_json)
+    .bind(response_json)
+    .bind(row.importance.map(|v| v as i64))
+    .bind(enum_text(&a.status))
+    .bind(a.estimated_cost.map(|d| d.to_string()))
+    .bind(a.charged_cost.map(|d| d.to_string()))
+    .bind(a.budget_scope.clone())
+    .bind(a.logical_request_id.map(|id| id.to_string()))
+    .bind(a.attempt as i64)
+    .bind(a.rejection.clone())
+    .bind(a.reserved_cost.map(|d| d.to_string()))
+    .bind(a.retry as i64)
+    .bind(a.dispatched as i64)
+    .bind(a.cost_note.clone())
+    .bind(a.error_kind.as_ref().and_then(enum_text))
+    .bind(row.usage.cached_tokens.map(|v| v as i64))
+    .bind(row.usage.cache_creation_tokens.map(|v| v as i64))
+    .bind(row.usage.reasoning_tokens.map(|v| v as i64))
+    .bind(other_tokens)
+    .bind(cost_json)
+    .execute(&mut *conn)
+    .await
+    .map_err(storage_err)?;
+    Ok(())
+}
+
+/// Budget bucket key: scope (`g` = global, `s:<name>`) and period (`D<yyyy-mm-dd>`
+/// or `M<yyyy-mm>`, UTC). The period's fixed shape at the end keeps keys unique.
+fn bucket(scope: Option<&str>, period: &str) -> String {
+    match scope {
+        None => format!("g|{period}"),
+        Some(s) => format!("s:{s}|{period}"),
+    }
+}
+
+fn day_period(at: DateTime<Utc>) -> String {
+    format!("D{}", at.format("%Y-%m-%d"))
+}
+
+fn month_period(at: DateTime<Utc>) -> String {
+    format!("M{}", at.format("%Y-%m"))
+}
+
+/// Buckets a row's charge counts toward.
+fn row_buckets(scope: Option<&str>, at: DateTime<Utc>) -> Vec<String> {
+    let (day, month) = (day_period(at), month_period(at));
+    let mut out = vec![bucket(None, &day), bucket(None, &month)];
+    if let Some(s) = scope {
+        out.push(bucket(Some(s), &day));
+        out.push(bucket(Some(s), &month));
+    }
+    out
+}
+
+fn parse_time(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|d| d.with_timezone(&Utc))
+}
+
+/// What a stored row counts against budgets ([`RequestUsage::budget_charge`]).
+fn stored_charge(charged: Option<String>, cost_amount: Option<String>) -> Decimal {
+    charged
+        .and_then(|s| s.parse().ok())
+        .or_else(|| cost_amount.and_then(|s| s.parse().ok()))
+        .unwrap_or(Decimal::ZERO)
+}
+
+async fn bucket_total(conn: &mut SqliteConnection, bucket: &str) -> AiResult<Decimal> {
+    let amount: Option<String> =
+        sqlx::query_scalar("SELECT amount FROM spend_totals WHERE bucket = ?")
+            .bind(bucket)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(storage_err)?;
+    amount
+        .map(|a| {
+            a.parse().map_err(|_| AiError::Storage {
+                message: format!("corrupt spend total for {bucket}"),
+            })
+        })
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
+/// Persist `row` and move every affected spend total by the difference between
+/// its new charge and the charge stored before (none for a new row). Replaying
+/// a write changes nothing; a crash leaves both or neither (one transaction).
+async fn write_row(conn: &mut SqliteConnection, row: &RequestUsage) -> AiResult<()> {
+    let old = sqlx::query(
+        "SELECT started_at, budget_scope, charged_cost, cost_amount FROM requests \
+         WHERE request_id = ?",
+    )
+    .bind(row.request_id.to_string())
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(storage_err)?;
+    upsert_row(conn, row).await?;
+
+    let mut deltas: HashMap<String, Decimal> = HashMap::new();
+    let new_charge = row.budget_charge();
+    for b in row_buckets(row.accounting.budget_scope.as_deref(), row.started_at) {
+        *deltas.entry(b).or_default() += new_charge;
+    }
+    if let Some(old) = old {
+        let charge = stored_charge(
+            old.try_get("charged_cost").ok().flatten(),
+            old.try_get("cost_amount").ok().flatten(),
+        );
+        // An old row with an unreadable timestamp was never counted.
+        if let Some(at) = parse_time(&old.get::<String, _>("started_at")) {
+            let scope: Option<String> = old.try_get("budget_scope").ok().flatten();
+            for b in row_buckets(scope.as_deref(), at) {
+                *deltas.entry(b).or_default() -= charge;
+            }
+        }
+    }
+    for (b, delta) in deltas {
+        if delta.is_zero() {
+            continue;
+        }
+        let total = bucket_total(conn, &b).await? + delta;
+        sqlx::query(
+            "INSERT INTO spend_totals (bucket, amount) VALUES (?, ?) \
+             ON CONFLICT(bucket) DO UPDATE SET amount = excluded.amount",
+        )
+        .bind(&b)
+        .bind(total.to_string())
+        .execute(&mut *conn)
+        .await
+        .map_err(storage_err)?;
+    }
+    Ok(())
+}
+
+/// Recompute every spend total from the rows (migration to schema v3).
+async fn rebuild_totals(conn: &mut SqliteConnection) -> AiResult<()> {
+    sqlx::query("DELETE FROM spend_totals")
+        .execute(&mut *conn)
+        .await
+        .map_err(storage_err)?;
+    let rows =
+        sqlx::query("SELECT started_at, budget_scope, charged_cost, cost_amount FROM requests")
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(storage_err)?;
+    let mut totals: HashMap<String, Decimal> = HashMap::new();
+    for r in rows {
+        let Some(at) = parse_time(&r.get::<String, _>("started_at")) else {
+            continue;
+        };
+        let scope: Option<String> = r.try_get("budget_scope").ok().flatten();
+        let charge = stored_charge(
+            r.try_get("charged_cost").ok().flatten(),
+            r.try_get("cost_amount").ok().flatten(),
+        );
+        for b in row_buckets(scope.as_deref(), at) {
+            *totals.entry(b).or_default() += charge;
+        }
+    }
+    for (b, amount) in totals {
+        sqlx::query("INSERT INTO spend_totals (bucket, amount) VALUES (?, ?)")
+            .bind(b)
+            .bind(amount.to_string())
+            .execute(&mut *conn)
+            .await
+            .map_err(storage_err)?;
+    }
+    Ok(())
+}
+
+/// The bucket for exactly one UTC day or month window, if `[start, end)` is one.
+fn window_bucket(scope: Option<&str>, start: DateTime<Utc>, end: DateTime<Utc>) -> Option<String> {
+    let midnight = start.time() == chrono::NaiveTime::MIN;
+    if !midnight {
+        return None;
+    }
+    if end == start + chrono::Duration::days(1) {
+        return Some(bucket(scope, &day_period(start)));
+    }
+    let d = start.date_naive();
+    let next_month = if d.month() == 12 {
+        chrono::NaiveDate::from_ymd_opt(d.year() + 1, 1, 1)
+    } else {
+        chrono::NaiveDate::from_ymd_opt(d.year(), d.month() + 1, 1)
+    }?;
+    (d.day() == 1 && end.date_naive() == next_month && end.time() == chrono::NaiveTime::MIN)
+        .then(|| bucket(scope, &month_period(start)))
+}
+
 #[async_trait]
 impl Storage for SqliteStorage {
     async fn save_request(&self, row: &RequestUsage) -> AiResult<()> {
-        let request_json =
-            serde_json::to_string(&row.request_json).map_err(|e| AiError::Serialization {
-                message: e.to_string(),
-            })?;
-        let response_json = row
-            .response_json
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| AiError::Serialization {
-                message: e.to_string(),
-            })?;
-        let other_tokens = (!row.usage.other_tokens.is_empty())
-            .then(|| serde_json::to_string(&row.usage.other_tokens))
-            .transpose()
-            .map_err(|e| AiError::Serialization {
-                message: e.to_string(),
-            })?;
-        let cost_json = row
-            .cost
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| AiError::Serialization {
-                message: e.to_string(),
-            })?;
-        let a = &row.accounting;
-        sqlx::query(
-            r#"
-            INSERT OR REPLACE INTO requests
-            (request_id, provider, account, api_key, model, started_at, finished_at,
-             prompt_tokens, completion_tokens, total_tokens, cost_amount, success, latency_ms,
-             request_json, response_json, importance,
-             cost_status, estimated_cost, charged_cost, budget_scope, logical_request_id,
-             attempt, rejection,
-             reserved_cost, retry, dispatched, cost_note, error_kind,
-             cached_tokens, cache_creation_tokens, reasoning_tokens, other_tokens, cost_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            "#,
+        let mut tx = self.begin_immediate().await?;
+        write_row(&mut tx, row).await?;
+        tx.commit().await.map_err(storage_err)
+    }
+
+    fn atomic_reservations(&self) -> bool {
+        true
+    }
+
+    async fn list_attempts(&self, logical: &RequestId) -> AiResult<Vec<RequestUsage>> {
+        let id = logical.to_string();
+        let rows = sqlx::query(
+            "SELECT * FROM requests WHERE logical_request_id = ? \
+             OR (logical_request_id IS NULL AND request_id = ?)",
         )
-        .bind(row.request_id.to_string())
-        .bind(row.provider.to_string())
-        .bind(row.account.to_string())
-        .bind(row.api_key.as_ref().map(|k| k.to_string()))
-        .bind(row.model.to_string())
-        .bind(row.started_at.to_rfc3339())
-        .bind(row.finished_at.to_rfc3339())
-        .bind(row.usage.prompt_tokens as i64)
-        .bind(row.usage.completion_tokens as i64)
-        .bind(row.usage.total_tokens as i64)
-        .bind(row.cost.as_ref().map(|c| c.amount.to_string()))
-        .bind(row.success as i64)
-        .bind(row.latency_ms as i64)
-        .bind(request_json)
-        .bind(response_json)
-        .bind(row.importance.map(|v| v as i64))
-        .bind(enum_text(&a.status))
-        .bind(a.estimated_cost.map(|d| d.to_string()))
-        .bind(a.charged_cost.map(|d| d.to_string()))
-        .bind(a.budget_scope.clone())
-        .bind(a.logical_request_id.map(|id| id.to_string()))
-        .bind(a.attempt as i64)
-        .bind(a.rejection.clone())
-        .bind(a.reserved_cost.map(|d| d.to_string()))
-        .bind(a.retry as i64)
-        .bind(a.dispatched as i64)
-        .bind(a.cost_note.clone())
-        .bind(a.error_kind.as_ref().and_then(enum_text))
-        .bind(row.usage.cached_tokens.map(|v| v as i64))
-        .bind(row.usage.cache_creation_tokens.map(|v| v as i64))
-        .bind(row.usage.reasoning_tokens.map(|v| v as i64))
-        .bind(other_tokens)
-        .bind(cost_json)
-        .execute(&self.pool)
+        .bind(&id)
+        .bind(&id)
+        .fetch_all(&self.pool)
         .await
         .map_err(storage_err)?;
-        Ok(())
+        let mut rows: Vec<RequestUsage> = rows.iter().map(Self::map_request_row).collect();
+        rows.sort_by_key(|r| r.accounting.attempt);
+        Ok(rows)
+    }
+
+    async fn reserve(&self, row: &RequestUsage, limits: &SpendLimits) -> AiResult<()> {
+        let mut tx = self.begin_immediate().await?;
+        let scope = row.accounting.budget_scope.as_deref();
+        let (day, month) = (day_period(row.started_at), month_period(row.started_at));
+        let day_spent = bucket_total(&mut tx, &bucket(None, &day)).await?;
+        let month_spent = bucket_total(&mut tx, &bucket(None, &month)).await?;
+        let scope_day = match scope {
+            Some(s) => Some(bucket_total(&mut tx, &bucket(Some(s), &day)).await?),
+            None => None,
+        };
+        crate::budget::check_limits(
+            row.budget_charge(),
+            scope,
+            limits,
+            day_spent,
+            month_spent,
+            scope_day,
+        )?;
+        write_row(&mut tx, row).await?;
+        tx.commit().await.map_err(storage_err)
     }
 
     async fn get_request(&self, id: &RequestId) -> AiResult<Option<RequestUsage>> {
@@ -436,6 +686,11 @@ impl Storage for SqliteStorage {
         start: chrono::DateTime<chrono::Utc>,
         end: chrono::DateTime<chrono::Utc>,
     ) -> AiResult<Decimal> {
+        // Budget periods are kept as running totals, updated with every row.
+        if let Some(b) = window_bucket(scope, start, end) {
+            let mut conn = self.pool.acquire().await.map_err(storage_err)?;
+            return bucket_total(&mut conn, &b).await;
+        }
         // `started_at` is RFC 3339 text: prefilter by date prefix in SQL, then compare
         // parsed timestamps exactly; sum as Decimal (SQL SUM would go through floats).
         let rows = sqlx::query(

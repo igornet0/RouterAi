@@ -17,8 +17,8 @@ use tracing::Instrument;
 use crate::account::{AccountManager, ApiKeyInfo, ApiKeyManager};
 use crate::balance::{Balance, BalanceManager, BalanceMonitor, BalanceMonitorConfig};
 use crate::budget::{
-    input_bound, output_bound, worst_case_cost, BudgetScope, BudgetStatus, PeriodLimits,
-    RequestBudget, SpendLedger,
+    input_bound, output_bound, worst_case_cost, BudgetScope, BudgetStatus, RequestBudget,
+    SpendLedger,
 };
 use crate::capability::{Capability, ProviderCapabilities};
 use crate::config::MissingUsagePolicy;
@@ -35,7 +35,7 @@ use crate::provider::{DynProvider, Provider, ProviderCredential};
 use crate::provider_catalog::build_provider_template;
 use crate::router::Router;
 use crate::secrets::{MemorySecretStore, SecretStore};
-use crate::storage::{MemoryStorage, Storage};
+use crate::storage::{MemoryStorage, SpendLimits, Storage};
 use crate::telemetry::{NoopTelemetry, TelemetrySink};
 use crate::types::{
     AccountId, ChatRequest, ChatResponse, ChatStream, Content, ContentPart, KeyId, Message,
@@ -63,6 +63,8 @@ pub struct AiClient {
     telemetry: Arc<dyn TelemetrySink>,
     core: Arc<Core>,
     default_account: AccountId,
+    /// Serializes reconciliations (read-modify-write of one row).
+    reconcile_lock: tokio::sync::Mutex<()>,
 }
 
 /// Id and capabilities of a configured provider (no adapter handle, so no way
@@ -85,6 +87,7 @@ pub struct AiClientBuilder {
     telemetry: Option<Arc<dyn TelemetrySink>>,
     load_example_prices: bool,
     allow_empty_providers: bool,
+    recent_attempts: usize,
 }
 
 impl Default for AiClientBuilder {
@@ -105,6 +108,7 @@ impl AiClientBuilder {
             telemetry: None,
             load_example_prices: false,
             allow_empty_providers: false,
+            recent_attempts: crate::usage::DEFAULT_RECENT_ATTEMPTS,
         }
     }
 
@@ -163,6 +167,13 @@ impl AiClientBuilder {
         self
     }
 
+    /// How many recent attempt rows to keep in memory (default
+    /// [`crate::usage::DEFAULT_RECENT_ATTEMPTS`]); statistics are unaffected.
+    pub fn recent_attempts(mut self, capacity: usize) -> Self {
+        self.recent_attempts = capacity;
+        self
+    }
+
     /// Load bundled example prices into the registry (explicit opt-in).
     pub fn with_example_prices(mut self) -> Self {
         self.load_example_prices = true;
@@ -197,7 +208,7 @@ impl AiClientBuilder {
 
         let models = Arc::new(ModelRegistry::new());
         let keys = Arc::new(ApiKeyManager::new(store));
-        let usage = Arc::new(UsageManager::new());
+        let usage = Arc::new(UsageManager::with_capacity(self.recent_attempts));
         let cost = Arc::new(CostManager::new(pricing));
         let ledger = Arc::new(SpendLedger::new(Arc::clone(&storage)));
         let core = Arc::new(Core {
@@ -208,6 +219,7 @@ impl AiClientBuilder {
             events: Arc::clone(&events),
             telemetry: Arc::clone(&telemetry),
             store_content: self.config.store_request_content,
+            unbounded: Default::default(),
         });
 
         Ok(AiClient {
@@ -227,6 +239,7 @@ impl AiClientBuilder {
             telemetry,
             core,
             default_account: AccountId::new("default"),
+            reconcile_lock: tokio::sync::Mutex::new(()),
         })
     }
 }
@@ -496,9 +509,12 @@ impl AiClient {
     }
 
     /// Every attempt (retries, fallbacks, rejections) of the logical request that
-    /// `attempt_id` belongs to, in attempt order (in memory). Sum their
-    /// [`RequestUsage::budget_charge`] for what the logical request cost —
-    /// `ChatResponse::request_id` identifies only the attempt that answered.
+    /// `attempt_id` belongs to, in attempt order, from this process's recent rows
+    /// (bounded; see [`UsageManager`]). Sum their [`RequestUsage::budget_charge`]
+    /// for what the logical request cost — `ChatResponse::request_id` identifies
+    /// only the attempt that answered. For an authoritative answer (older
+    /// requests, other processes, after a restart) use
+    /// [`AiClient::load_logical_request_attempts`].
     pub fn logical_request_attempts(&self, attempt_id: &RequestId) -> Vec<RequestUsage> {
         let Some(logical) = self
             .usage
@@ -507,14 +523,123 @@ impl AiClient {
         else {
             return Vec::new();
         };
-        let mut rows: Vec<RequestUsage> = self
-            .usage
-            .list()
-            .into_iter()
-            .filter(|r| r.accounting.logical_request_id.unwrap_or(r.request_id) == logical)
-            .collect();
-        rows.sort_by_key(|r| r.accounting.attempt);
-        rows
+        self.usage.attempts_of(&logical)
+    }
+
+    /// Every persisted attempt of the logical request that `attempt_id` belongs
+    /// to, in attempt order — the storage's view, independent of this process's
+    /// memory. Empty when `attempt_id` is unknown.
+    pub async fn load_logical_request_attempts(
+        &self,
+        attempt_id: &RequestId,
+    ) -> AiResult<Vec<RequestUsage>> {
+        let Some(row) = self.storage.get_request(attempt_id).await? else {
+            return Ok(Vec::new());
+        };
+        let logical = row.accounting.logical_request_id.unwrap_or(row.request_id);
+        self.storage.list_attempts(&logical).await
+    }
+
+    /// Correct a settled attempt to what the provider later reported or billed
+    /// (usage export, costs API, invoice): the attempt's charge moves to the
+    /// reconciled amount and the budget ledger by the difference — a refund when
+    /// the attempt was charged its worst case, a surcharge when it was charged
+    /// less. The row becomes [`CostStatus::Reconciled`]; its `cost_note` keeps the
+    /// source, the previous status and charge, and the adjustment.
+    ///
+    /// Refused for attempts still `Pending` (in flight — or orphaned: run
+    /// [`AiClient::recover_orphaned_reservations`] first) and for `Rejected` ones
+    /// (never sent). Usage that cannot be priced is `PricingUnavailable`; the
+    /// amount must not be negative and the source must not be empty.
+    /// Reconciling again with the same amount and source changes nothing.
+    pub async fn reconcile_attempt(
+        &self,
+        attempt_id: &RequestId,
+        with: crate::usage::Reconciliation,
+    ) -> AiResult<RequestUsage> {
+        use crate::usage::Reconciliation;
+        let _serial = self.reconcile_lock.lock().await;
+        let mut row =
+            self.storage
+                .get_request(attempt_id)
+                .await?
+                .ok_or_else(|| AiError::NotFound {
+                    message: format!("request {attempt_id}"),
+                })?;
+        let invalid = |message: String| Err(AiError::InvalidRequest { message });
+        match row.accounting.status {
+            CostStatus::Pending => {
+                return invalid(format!(
+                    "attempt {attempt_id} is still pending (in flight or orphaned); \
+                     recover orphaned reservations before reconciling"
+                ))
+            }
+            CostStatus::Rejected => return invalid(format!("attempt {attempt_id} was never sent")),
+            _ => {}
+        }
+        let (cost, usage, source) = match with {
+            Reconciliation::Usage { usage, source } => {
+                let cost = self
+                    .cost
+                    .price(&row.provider, &row.model, &usage)
+                    .map_err(|_| AiError::PricingUnavailable {
+                        provider: row.provider.clone(),
+                        model: row.model.clone(),
+                    })?;
+                (cost, Some(usage), source)
+            }
+            Reconciliation::Amount { amount, source } => {
+                if amount.is_sign_negative() {
+                    return invalid(format!("reconciled amount {amount} is negative"));
+                }
+                let cost = crate::cost::Cost {
+                    amount,
+                    ..crate::cost::Cost::zero()
+                };
+                (cost, None, source)
+            }
+        };
+        let source = source.trim().to_string();
+        if source.is_empty() {
+            return invalid("reconciliation source is required".into());
+        }
+        let note_head = format!("reconciled from {source}:");
+        let previous = row.budget_charge();
+        if row.accounting.status == CostStatus::Reconciled
+            && row.accounting.charged_cost == Some(cost.amount)
+            && row
+                .accounting
+                .cost_note
+                .as_deref()
+                .is_some_and(|n| n.starts_with(&note_head))
+        {
+            return Ok(row);
+        }
+        let adjustment = cost.amount - previous;
+        row.accounting.cost_note = Some(format!(
+            "{note_head} previously {:?} charged {previous}; adjustment {adjustment}",
+            row.accounting.status
+        ));
+        row.accounting.status = CostStatus::Reconciled;
+        row.accounting.charged_cost = Some(cost.amount);
+        row.cost = Some(cost);
+        if let Some(usage) = usage {
+            row.usage = usage;
+        }
+        self.ledger.settle(previous, &row).await?;
+        self.usage.replace(row.clone());
+        tracing::info!(
+            target: "universal_ai::accounting",
+            attempt_id = %row.request_id,
+            provider = %row.provider,
+            model = %row.model,
+            previous_charge = %previous,
+            charged_cost = ?row.accounting.charged_cost,
+            adjustment = %adjustment,
+            source = %source,
+            "attempt reconciled"
+        );
+        Ok(row)
     }
 
     /// Committed spend (settled + reserved) for the current UTC day and month,
@@ -783,6 +908,7 @@ impl AiClient {
     /// Whether this request must pass the fail-closed budget gate.
     fn budget_controlled(&self, budget: &RequestBudget) -> bool {
         self.config.budget.is_limited()
+            || budget.require_cost_bound
             || budget.max_cost.is_some()
             || budget
                 .scope
@@ -852,6 +978,12 @@ impl AiClient {
         if !controlled {
             return Ok((Decimal::ZERO, bound.ok().map(|(n, _)| n)));
         }
+        if self.core.is_unbounded(provider_id, &request.model) {
+            return Err(AiError::WorstCaseUnbounded {
+                provider: provider_id.clone(),
+                model: request.model.clone(),
+            });
+        }
         let (tokens, source) = bound?;
         let estimate = estimate.ok_or_else(|| AiError::PricingUnavailable {
             provider: provider_id.clone(),
@@ -901,12 +1033,12 @@ impl AiClient {
         row.accounting.status = CostStatus::Pending;
         row.accounting.reserved_cost = Some(total);
         row.accounting.charged_cost = Some(total);
-        let limits = PeriodLimits {
+        let limits = SpendLimits {
             daily: self.config.budget.max_daily_cost,
             monthly: self.config.budget.max_monthly_cost,
+            scope_daily: budget.scope.as_ref().and_then(|s| s.daily_limit),
         };
-        let scope_daily = budget.scope.as_ref().and_then(|s| s.daily_limit);
-        self.ledger.reserve(row, limits, scope_daily).await?;
+        self.ledger.reserve(row, limits).await?;
         Ok((total, Some(tokens)))
     }
 
@@ -1186,7 +1318,7 @@ impl AiClient {
             reserved,
             ctx.controlled,
             started,
-            output_bound,
+            (input_bound(&req).total(), output_bound),
         );
         let span = tracing::info_span!(
             "ai.attempt",
@@ -1548,6 +1680,16 @@ impl<'a> ChatBuilder<'a> {
     /// output bound are known.
     pub fn max_cost(mut self, amount: Decimal) -> Self {
         self.options.budget.max_cost = Some(amount);
+        self
+    }
+
+    /// Make this request budget-controlled even when no limit applies: it is sent
+    /// only if its worst case can be priced and bounded (otherwise
+    /// [`AiError::PricingUnavailable`], [`AiError::OutputLimitUnknown`] or
+    /// [`AiError::WorstCaseUnbounded`] before any HTTP), and an attempt whose
+    /// actual cost cannot be determined is charged its reservation — never nothing.
+    pub fn require_cost_bound(mut self) -> Self {
+        self.options.budget.require_cost_bound = true;
         self
     }
 

@@ -34,6 +34,10 @@ Compiled versions of this and other examples are the crate-level doctests
 | Concurrent requests cannot oversubscribe the budget | `SpendLedger::reserve` (one lock) | `concurrency.rs` (10/50/100/500 + randomized) |
 | Spend survives restart and SIGKILL | reservation persisted before dispatch | `crash_recovery.rs` (real SIGKILL) |
 | Streams settle exactly once, also when dropped | `metered_stream` + `AttemptMeter::drop` | `stream_*`, `dropped_stream_*` |
+| One budget per SQLite database across clients and processes | `SqliteStorage::reserve` (`BEGIN IMMEDIATE`) + `spend_totals` | `shared_budget.rs` (incl. 3 separate processes) |
+| Settled attempts can be reconciled (refund / surcharge) with the ledger moving by the difference | `AiClient::reconcile_attempt` | `accounting.rs` |
+| A caller dropped *during* settlement does not interrupt it | settlement on its own task (`Core::finish`) | `settlement_cancellation.rs` |
+| A provider billing beyond the reserved token bounds is charged actual cost, and the model is refused for further budgeted requests | `Core::check_bounds` + `preflight` | `usage_beyond_reserved_bounds_*`, `input_beyond_byte_bound_*` |
 | Secrets never in errors / Debug / storage / stats / tracing / telemetry | adapters + `redact_secret` + `sanitize_message` | `secrets_regression.rs` |
 
 What is **not** guaranteed is listed in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#known-limits).

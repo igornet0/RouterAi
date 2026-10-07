@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::cost::{CostEstimate, CostManager, InputBound, OutputBoundSource};
 use crate::error::{AiError, AiResult};
 use crate::models::ModelRegistry;
-use crate::storage::Storage;
+use crate::storage::{SpendLimits, Storage};
 use crate::types::{ChatRequest, ProviderId};
 use crate::usage::RequestUsage;
 
@@ -48,6 +48,9 @@ pub(crate) struct RequestBudget {
     pub max_cost: Option<Decimal>,
     /// Scope the spend also counts toward.
     pub scope: Option<BudgetScope>,
+    /// Budget-controlled even without a limit (see
+    /// [`crate::ChatBuilder::require_cost_bound`]).
+    pub require_cost_bound: bool,
 }
 
 /// Spend snapshot for one scope.
@@ -139,11 +142,46 @@ pub(crate) fn worst_case_cost(
         })
 }
 
-/// Global limits checked inside the reservation.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct PeriodLimits {
-    pub daily: Option<Decimal>,
-    pub monthly: Option<Decimal>,
+/// Check `amount` against `limits` given the committed spend of the attempt's
+/// periods (`scope_day` = the scope's spend today, when the row has a scope).
+/// Shared by the in-process ledger and atomic storage reservations, so both
+/// refuse with the same errors.
+pub(crate) fn check_limits(
+    amount: Decimal,
+    scope: Option<&str>,
+    limits: &SpendLimits,
+    day: Decimal,
+    month: Decimal,
+    scope_day: Option<Decimal>,
+) -> AiResult<()> {
+    let mut checks = vec![
+        (None, day, limits.daily, false),
+        (None, month, limits.monthly, true),
+    ];
+    if let (Some(s), Some(spent)) = (scope, scope_day) {
+        checks.push((Some(s.to_string()), spent, limits.scope_daily, false));
+    }
+    for (scope, spent, limit, monthly) in checks {
+        let Some(limit) = limit else { continue };
+        if spent + amount > limit {
+            return Err(if monthly {
+                AiError::MonthlyLimitExceeded {
+                    scope,
+                    spent,
+                    requested: amount,
+                    limit,
+                }
+            } else {
+                AiError::DailyLimitExceeded {
+                    scope,
+                    spent,
+                    requested: amount,
+                    limit,
+                }
+            });
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -227,14 +265,18 @@ impl SpendLedger {
     /// Atomically check limits and charge `row` (status Pending, `charged_cost` =
     /// worst case). The pending row is persisted before the totals change, so a
     /// reservation survives restarts. Fails closed if storage cannot answer.
-    pub(crate) async fn reserve(
-        &self,
-        row: &RequestUsage,
-        limits: PeriodLimits,
-        scope_daily: Option<Decimal>,
-    ) -> AiResult<()> {
+    ///
+    /// With a storage that reserves atomically (SQLite) the check and the insert
+    /// are one database transaction, so every process sharing the database sees
+    /// one budget; the in-process lock only avoids needless lock contention.
+    /// Otherwise the decision is made here, under the in-process lock, against
+    /// totals cached from storage (one ledger per storage).
+    pub(crate) async fn reserve(&self, row: &RequestUsage, limits: SpendLimits) -> AiResult<()> {
         let amount = row.budget_charge();
         let mut totals = self.totals.lock().await;
+        if self.storage.atomic_reservations() {
+            return self.storage.reserve(row, &limits).await;
+        }
         // Drop finished periods; current ones are reloaded from storage when needed.
         let (today, month) = (Period::day(row.started_at), Period::month(row.started_at));
         totals.retain(|(_, p), _| *p == today || *p == month);
@@ -243,37 +285,16 @@ impl SpendLedger {
         for key in &keys {
             self.load(&mut totals, key).await?;
         }
-        let spent = |key: &TotalsKey| totals.get(key).copied().unwrap_or_default();
-        let scope = row.accounting.budget_scope.clone();
-        let mut checks = vec![
-            ((None, today), limits.daily, false),
-            ((None, month), limits.monthly, true),
-        ];
-        if let Some(s) = &scope {
-            checks.push(((Some(s.clone()), today), scope_daily, false));
-        }
-        for (key, limit, monthly) in checks {
-            let Some(limit) = limit else { continue };
-            let already = spent(&key);
-            if already + amount > limit {
-                let (scope, spent, requested) = (key.0.clone(), already, amount);
-                return Err(if monthly {
-                    AiError::MonthlyLimitExceeded {
-                        scope,
-                        spent,
-                        requested,
-                        limit,
-                    }
-                } else {
-                    AiError::DailyLimitExceeded {
-                        scope,
-                        spent,
-                        requested,
-                        limit,
-                    }
-                });
-            }
-        }
+        let spent = |key: TotalsKey| totals.get(&key).copied().unwrap_or_default();
+        let scope = row.accounting.budget_scope.as_deref();
+        check_limits(
+            amount,
+            scope,
+            &limits,
+            spent((None, today)),
+            spent((None, month)),
+            scope.map(|s| spent((Some(s.to_string()), today))),
+        )?;
 
         self.storage.save_request(row).await?;
         for key in keys {
@@ -288,8 +309,9 @@ impl SpendLedger {
     pub(crate) async fn settle(&self, reserved: Decimal, row: &RequestUsage) -> AiResult<()> {
         let mut totals = self.totals.lock().await;
         self.storage.save_request(row).await?;
+        // Atomic storages keep their own totals (updated with the row).
         let delta = row.budget_charge() - reserved;
-        if !delta.is_zero() {
+        if !delta.is_zero() && !self.storage.atomic_reservations() {
             for key in Self::keys(row) {
                 // Only adjust periods already loaded; others read the row from storage.
                 if let Some(v) = totals.get_mut(&key) {
@@ -303,14 +325,21 @@ impl SpendLedger {
     /// Committed spend (settled + reserved) for the current UTC day and month.
     pub(crate) async fn status(&self, scope: Option<&str>) -> AiResult<BudgetStatus> {
         let now = Utc::now();
-        let mut totals = self.totals.lock().await;
-        let scope_key = scope.map(str::to_string);
-        let daily_spent = self
-            .load(&mut totals, &(scope_key.clone(), Period::day(now)))
-            .await?;
-        let monthly_spent = self
-            .load(&mut totals, &(scope_key, Period::month(now)))
-            .await?;
+        let (day, month) = (Period::day(now), Period::month(now));
+        let (daily_spent, monthly_spent) = if self.storage.atomic_reservations() {
+            // Shared with other processes: always ask the database.
+            let spend = |p: Period| {
+                let (start, end) = p.window();
+                self.storage.spend_in_window(scope, start, end)
+            };
+            (spend(day).await?, spend(month).await?)
+        } else {
+            let mut totals = self.totals.lock().await;
+            let scope_key = scope.map(str::to_string);
+            let daily_spent = self.load(&mut totals, &(scope_key.clone(), day)).await?;
+            let monthly_spent = self.load(&mut totals, &(scope_key, month)).await?;
+            (daily_spent, monthly_spent)
+        };
         Ok(BudgetStatus {
             scope: scope.map(str::to_string),
             day: now.date_naive(),

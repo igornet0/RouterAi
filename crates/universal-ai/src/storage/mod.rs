@@ -11,6 +11,19 @@ use crate::error::{AiError, AiResult};
 use crate::types::RequestId;
 use crate::usage::{validate_importance, CostStatus, RequestUsage};
 
+/// Spend limits a reservation must fit (see [`Storage::reserve`]). `None` = no
+/// limit. Periods are UTC calendar days / months.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SpendLimits {
+    /// Global daily limit.
+    pub daily: Option<Decimal>,
+    /// Global monthly limit.
+    pub monthly: Option<Decimal>,
+    /// Daily limit of the row's budget scope (only when it has one).
+    pub scope_daily: Option<Decimal>,
+}
+
 /// Storage backend for history / accounts.
 #[async_trait]
 pub trait Storage: Send + Sync {
@@ -56,6 +69,38 @@ pub trait Storage: Send + Sync {
             .filter(|r| scope.is_none() || r.accounting.budget_scope.as_deref() == scope)
             .map(RequestUsage::budget_charge)
             .sum())
+    }
+
+    /// Every persisted attempt of the logical request `logical` (the first
+    /// attempt's id), in attempt order. The default scans
+    /// [`Storage::list_requests`]; persistent backends should override it.
+    async fn list_attempts(&self, logical: &RequestId) -> AiResult<Vec<RequestUsage>> {
+        let mut rows: Vec<RequestUsage> = self
+            .list_requests(usize::MAX)
+            .await?
+            .into_iter()
+            .filter(|r| r.accounting.logical_request_id.unwrap_or(r.request_id) == *logical)
+            .collect();
+        rows.sort_by_key(|r| r.accounting.attempt);
+        Ok(rows)
+    }
+
+    /// Whether [`Storage::reserve`] decides atomically for every process sharing
+    /// this storage. When `false` (the default) the client's in-process ledger
+    /// decides — correct only while a single client uses the storage.
+    fn atomic_reservations(&self) -> bool {
+        false
+    }
+
+    /// Atomically check `limits` against the committed spend (settled + reserved)
+    /// of `row`'s periods and persist `row` (a `Pending` reservation): two
+    /// reservations can never both be admitted on the same headroom. Called only
+    /// when [`Storage::atomic_reservations`] is `true`.
+    async fn reserve(&self, row: &RequestUsage, limits: &SpendLimits) -> AiResult<()> {
+        let _ = (row, limits);
+        Err(AiError::Storage {
+            message: "atomic reservations are not supported by this storage".into(),
+        })
     }
 
     /// Mark rows still [`CostStatus::Pending`] that started before `before` as

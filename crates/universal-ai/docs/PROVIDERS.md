@@ -9,6 +9,28 @@
 | `Anthropic` | yes | yes | yes | no (not mapped) | — | prompt = input + cache reads + cache writes; cache writes → `cache_creation_tokens`; 1-hour cache writes / server tool requests → `other_tokens`; output includes thinking |
 | `Gemini` | yes | no | yes | no (not mapped) | — | completion = candidates + `thoughtsTokenCount` (reasoning); prompt += `toolUsePromptTokenCount`; `cachedContentTokenCount` → cached; non-text modalities and unexplained `totalTokenCount` → `other_tokens` |
 
+## Output limit
+
+`ChatRequest::max_tokens` (`ChatBuilder::max_tokens`) bounds **all** output tokens,
+reasoning / thinking included; it is the output bound of the worst case. Each
+adapter sends it — for chat and streams alike — in the parameter with that
+meaning:
+
+| Adapter | Wire parameter | Reasoning inside the bound |
+|---|---|---|
+| `OpenAI` | `max_completion_tokens` | yes (documented by OpenAI; reasoning models reject `max_tokens`) |
+| `DeepSeek`, `OpenRouter`, `OpenAICompatible` | `max_tokens` (`OpenAICompatibleBuilder::output_limit_param` switches to `max_completion_tokens`) | provider-dependent — not proven |
+| `Anthropic` | `max_tokens` (required by the API: 1024 is sent when an *uncontrolled* request has none) | yes (thinking counts toward `max_tokens`; the adapter does not enable thinking) |
+| `Gemini` | `generationConfig.maxOutputTokens` | not proven |
+
+Budget-controlled requests always carry a bound: the request's `max_tokens`, or
+the registry's `max_output_tokens` pinned into the request; with neither they are
+refused before HTTP (`OutputLimitUnknown`). Where reasoning inside the bound is
+not proven, a provider that bills beyond it trips `WorstCaseUnbounded` (see
+[BUDGETS](BUDGETS.md#when-the-provider-bills-beyond-the-worst-case)). Proven by
+`tests/output_limits.rs` (every adapter, chat + stream, explicit and pinned
+bounds, refusal without a bound).
+
 Capabilities are checked before any reservation or HTTP: a request that needs
 streaming, tools or structured output skips providers without them; if none is
 left the request fails with `UnsupportedCapability`.

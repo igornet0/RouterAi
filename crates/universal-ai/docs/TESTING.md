@@ -12,7 +12,11 @@ No test needs network access or real keys: providers are mocked in-process
 | Suite | Covers |
 |---|---|
 | unit tests (`src/**`) | pricing policy, token breakdown, cost per class, estimates, error classification, `Retry-After`, settlement rules (`execution`), sanitization |
-| `financial_invariants.rs` | normal / retry / timeout / fallback / malformed / cancel / dropped future / streams (complete, no usage, duplicate usage, network error, dropped, dropped after usage) / cumulative caps; every test checks the ledger invariants |
+| `financial_invariants.rs` | normal / retry / timeout / fallback / malformed / cancel / dropped future / streams (complete, no usage, duplicate usage, network error, dropped, dropped after usage) / cumulative caps / usage beyond the reserved bounds (`WorstCaseUnbounded`); every test checks the ledger invariants |
+| `settlement_cancellation.rs` | the caller (request future / stream) dropped *while* its settlement is being persisted: the row still settles and reaches the statistics |
+| `accounting.rs` | attempts loaded from storage after eviction and restart; reconciliation: refund, surcharge, idempotent replay, refusals (pending, rejected, negative, no source, unpriceable, unknown id), SQLite and memory, rows outside the recent window |
+| `shared_budget.rs` | one budget per SQLite database: two clients and three separate processes admit exactly what fits; running totals equal the rows after mixed traffic (scopes, retries, timeouts, streams, drops); replayed settlement; v2 → v3 rebuild |
+| `output_limits.rs` | every adapter sends the output bound in its reasoning-inclusive parameter (chat + stream), pins the registry bound, refuses unbounded budgeted requests before HTTP |
 | `concurrency.rs` | 10 / 50 / 100 / 500 concurrent mixed requests (success, timeout, 503, no usage, stream) and randomized mixes; `committed ≤ budget` at every write and at every dispatch |
 | `crash_recovery.rs` | SIGKILL of a child process after reserve, before settlement, after settlement (also WAL), with concurrent reservations; schema migrations v0 / v1, newer-schema refusal, column round trip |
 | `provider_usage.rs` | OpenAI cached / reasoning / audio, Anthropic cache writes and SSE, Gemini thinking tokens and unexplained totals, malformed / null / duplicate SSE usage, validation before HTTP |

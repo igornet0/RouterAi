@@ -15,7 +15,7 @@ use routerai::{
 use secrecy::SecretString;
 use serde_json::{json, Value};
 use universal_ai::http::HttpClient;
-use universal_ai::{AiClient, Anthropic, Gemini, OpenAICompatible};
+use universal_ai::{AiClient, Anthropic, Gemini, ModelPricing, OpenAICompatible, ProviderId};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
@@ -128,6 +128,17 @@ async fn register_tools(rt: &RouterRuntime) -> Tools {
     tools
 }
 
+/// The runtime refuses models without a known price: register one.
+fn priced(ai: AiClient, provider: ProviderId, model: &str) -> AiClient {
+    ai.pricing().upsert(ModelPricing::per_million(
+        provider,
+        model,
+        "1".parse().unwrap(),
+        "2".parse().unwrap(),
+    ));
+    ai
+}
+
 fn agent_with_tools(tools: &[&str]) -> Agent {
     let mut agent = routerai::published_agent("tools-agent", "Use tools when helpful.");
     agent.tools = tools.iter().map(|t| t.to_string()).collect();
@@ -197,7 +208,12 @@ async fn openai_runtime(
         .api_key(SecretString::new("sk-test".into()))
         .build()
         .unwrap();
-    let ai = AiClient::builder().provider(provider).build().unwrap();
+    // The agents' default model is served by the only configured provider.
+    let ai = priced(
+        AiClient::builder().provider(provider).build().unwrap(),
+        ProviderId::openai_compatible(),
+        "deepseek-chat",
+    );
     let rt = RouterRuntime::builder()
         .ai(Arc::new(ai))
         .build()
@@ -612,7 +628,11 @@ async fn anthropic_agent_tool_loop() {
         HttpClient::new(Default::default()).unwrap(),
     )
     .unwrap();
-    let ai = AiClient::builder().provider(provider).build().unwrap();
+    let ai = priced(
+        AiClient::builder().provider(provider).build().unwrap(),
+        ProviderId::anthropic(),
+        "claude-test",
+    );
     let rt = RouterRuntime::builder()
         .ai(Arc::new(ai))
         .build()
@@ -675,7 +695,11 @@ async fn gemini_agent_tool_loop() {
         HttpClient::new(Default::default()).unwrap(),
     )
     .unwrap();
-    let ai = AiClient::builder().provider(provider).build().unwrap();
+    let ai = priced(
+        AiClient::builder().provider(provider).build().unwrap(),
+        ProviderId::gemini(),
+        "gemini-test",
+    );
     let rt = RouterRuntime::builder()
         .ai(Arc::new(ai))
         .build()

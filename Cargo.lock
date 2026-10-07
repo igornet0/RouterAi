@@ -1751,7 +1751,7 @@ dependencies = [
 
 [[package]]
 name = "routerai"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1772,7 +1772,7 @@ dependencies = [
 
 [[package]]
 name = "routerai-adapters"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1788,7 +1788,7 @@ dependencies = [
 
 [[package]]
 name = "routerai-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "clap",
@@ -1804,7 +1804,7 @@ dependencies = [
 
 [[package]]
 name = "routerai-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "chrono",
@@ -2801,7 +2801,7 @@ checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
 
 [[package]]
 name = "universal-ai"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2827,7 +2827,7 @@ dependencies = [
 
 [[package]]
 name = "universal-ai-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "clap",

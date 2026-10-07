@@ -1,6 +1,6 @@
 //! Token usage tracking.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -244,6 +244,10 @@ pub enum CostStatus {
     /// charged the actual cost when final usage had arrived, otherwise the
     /// reservation (or estimate).
     Abandoned,
+    /// Settled earlier, then corrected to what the provider reported or billed
+    /// ([`crate::AiClient::reconcile_attempt`]); `cost_note` records the source,
+    /// the previous status and charge, and the adjustment.
+    Reconciled,
 }
 
 /// Budget accounting attached to each [`RequestUsage`] row (one row per physical
@@ -345,14 +349,7 @@ impl UsageStatistics {
         self.total_tokens += row.usage.total_tokens;
         if let Some(cost) = &row.cost {
             self.total_cost += cost.amount;
-        } else if row.success
-            || matches!(
-                row.accounting.status,
-                CostStatus::UsageUnavailable
-                    | CostStatus::PricingUnavailable
-                    | CostStatus::Abandoned
-            )
-        {
+        } else if counts_as_unknown(row) {
             self.unknown_cost_requests += 1;
         }
         self.charged_cost += row.budget_charge();
@@ -362,71 +359,421 @@ impl UsageStatistics {
     }
 }
 
-/// In-memory usage manager.
-#[derive(Debug, Default)]
+/// Aggregates of [`UsageStatistics`] that can also take a row back out (for
+/// reconciliation): latency is kept as a sum instead of a running average.
+#[derive(Debug, Clone, Default)]
+struct Aggregate {
+    stats: UsageStatistics,
+    latency_sum_ms: u128,
+}
+
+impl Aggregate {
+    fn add(&mut self, row: &RequestUsage) {
+        self.stats.record(row);
+        self.latency_sum_ms += u128::from(row.latency_ms);
+        self.refresh_latency();
+    }
+
+    /// Exact inverse of [`Aggregate::add`] for the same row.
+    fn remove(&mut self, row: &RequestUsage) {
+        let s = &mut self.stats;
+        s.requests = s.requests.saturating_sub(1);
+        if row.success {
+            s.successful_requests = s.successful_requests.saturating_sub(1);
+        } else {
+            s.failed_requests = s.failed_requests.saturating_sub(1);
+        }
+        s.input_tokens = s.input_tokens.saturating_sub(row.usage.prompt_tokens);
+        s.output_tokens = s.output_tokens.saturating_sub(row.usage.completion_tokens);
+        s.total_tokens = s.total_tokens.saturating_sub(row.usage.total_tokens);
+        if let Some(cost) = &row.cost {
+            s.total_cost -= cost.amount;
+        } else if counts_as_unknown(row) {
+            s.unknown_cost_requests = s.unknown_cost_requests.saturating_sub(1);
+        }
+        s.charged_cost -= row.budget_charge();
+        self.latency_sum_ms = self
+            .latency_sum_ms
+            .saturating_sub(u128::from(row.latency_ms));
+        self.refresh_latency();
+    }
+
+    fn refresh_latency(&mut self) {
+        self.stats.average_latency_ms = if self.stats.requests == 0 {
+            0.0
+        } else {
+            self.latency_sum_ms as f64 / self.stats.requests as f64
+        };
+    }
+}
+
+fn counts_as_unknown(row: &RequestUsage) -> bool {
+    row.success
+        || matches!(
+            row.accounting.status,
+            CostStatus::UsageUnavailable | CostStatus::PricingUnavailable | CostStatus::Abandoned
+        )
+}
+
+/// Default number of recent attempt rows kept in memory.
+pub const DEFAULT_RECENT_ATTEMPTS: usize = 10_000;
+/// Days of per-day statistics kept in memory.
+const DAYS_KEPT: usize = 400;
+
+#[derive(Debug)]
+struct UsageState {
+    capacity: usize,
+    total: Aggregate,
+    by_day: BTreeMap<chrono::NaiveDate, Aggregate>,
+    by_provider: HashMap<ProviderId, Aggregate>,
+    /// Recent rows (content stripped), oldest first in `order`.
+    rows: HashMap<RequestId, RequestUsage>,
+    order: VecDeque<RequestId>,
+    /// Logical request id → its attempts among the recent rows.
+    by_logical: HashMap<RequestId, Vec<RequestId>>,
+}
+
+impl UsageState {
+    fn aggregates(&mut self, row: &RequestUsage) -> [&mut Aggregate; 3] {
+        let day = self.by_day.entry(row.started_at.date_naive()).or_default();
+        let provider = self.by_provider.entry(row.provider.clone()).or_default();
+        [&mut self.total, day, provider]
+    }
+
+    fn evict(&mut self) {
+        while self.rows.len() > self.capacity {
+            let Some(id) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(row) = self.rows.remove(&id) {
+                let logical = logical_id(&row);
+                if let Some(ids) = self.by_logical.get_mut(&logical) {
+                    ids.retain(|i| i != &id);
+                    if ids.is_empty() {
+                        self.by_logical.remove(&logical);
+                    }
+                }
+            }
+        }
+        while self.by_day.len() > DAYS_KEPT {
+            self.by_day.pop_first();
+        }
+    }
+}
+
+fn logical_id(row: &RequestUsage) -> RequestId {
+    row.accounting.logical_request_id.unwrap_or(row.request_id)
+}
+
+/// Rows are kept without prompt / response content (it stays in storage).
+fn strip_content(mut row: RequestUsage) -> RequestUsage {
+    row.request_json = serde_json::json!({});
+    row.response_json = None;
+    row
+}
+
+/// In-memory usage statistics of this process plus a bounded index of its
+/// recent attempt rows.
+///
+/// * Statistics (all-time, per UTC day, per provider) are updated incrementally:
+///   O(1) per attempt, no row is rescanned to answer a query.
+/// * Only the most recent attempts (`DEFAULT_RECENT_ATTEMPTS` by default) are
+///   kept as rows, **without** prompt / response content; older rows, content
+///   and other processes' rows are in [`crate::Storage`].
+/// * The budget ledger, not this manager, is the source of truth for spend.
+#[derive(Debug)]
 pub struct UsageManager {
-    rows: std::sync::Mutex<Vec<RequestUsage>>,
+    state: std::sync::Mutex<UsageState>,
+}
+
+impl Default for UsageManager {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_RECENT_ATTEMPTS)
+    }
 }
 
 impl UsageManager {
-    /// Create empty manager.
+    /// Create empty manager keeping [`DEFAULT_RECENT_ATTEMPTS`] recent rows.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Record a completed request.
+    /// Create empty manager keeping at most `capacity` recent rows.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            state: std::sync::Mutex::new(UsageState {
+                capacity,
+                total: Aggregate::default(),
+                by_day: BTreeMap::new(),
+                by_provider: HashMap::new(),
+                rows: HashMap::new(),
+                order: VecDeque::new(),
+                by_logical: HashMap::new(),
+            }),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, UsageState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Record a settled attempt. Recording the same attempt id again replaces
+    /// the earlier row (its statistics are taken back out first).
     pub fn record(&self, row: RequestUsage) {
-        if let Ok(mut guard) = self.rows.lock() {
-            guard.push(row);
+        let row = strip_content(row);
+        let mut st = self.state();
+        if let Some(old) = st.rows.remove(&row.request_id) {
+            for agg in st.aggregates(&old) {
+                agg.remove(&old);
+            }
+            st.order.retain(|id| id != &row.request_id);
         }
+        for agg in st.aggregates(&row) {
+            agg.add(&row);
+        }
+        let logical = logical_id(&row);
+        let ids = st.by_logical.entry(logical).or_default();
+        if !ids.contains(&row.request_id) {
+            ids.push(row.request_id);
+        }
+        st.order.push_back(row.request_id);
+        st.rows.insert(row.request_id, row);
+        st.evict();
     }
 
-    /// Snapshot all rows.
+    /// Replace the recent row of a corrected attempt (reconciliation), moving
+    /// the statistics from `old` to `new`. Returns `false` (and changes nothing)
+    /// when the attempt is not among the recent rows of this process.
+    pub fn replace(&self, new: RequestUsage) -> bool {
+        let new = strip_content(new);
+        let mut st = self.state();
+        let Some(old) = st.rows.get(&new.request_id).cloned() else {
+            return false;
+        };
+        for agg in st.aggregates(&old) {
+            agg.remove(&old);
+        }
+        for agg in st.aggregates(&new) {
+            agg.add(&new);
+        }
+        st.rows.insert(new.request_id, new);
+        true
+    }
+
+    /// Recent rows, oldest first (bounded; content stripped).
     pub fn list(&self) -> Vec<RequestUsage> {
-        self.rows.lock().map(|g| g.clone()).unwrap_or_default()
+        let st = self.state();
+        st.order
+            .iter()
+            .filter_map(|id| st.rows.get(id).cloned())
+            .collect()
     }
 
-    /// Aggregate all.
+    /// Statistics of every attempt recorded by this process.
     pub fn statistics(&self) -> UsageStatistics {
-        let mut stats = UsageStatistics::default();
-        for row in self.list() {
-            stats.record(&row);
-        }
-        stats
+        self.state().total.stats.clone()
     }
 
-    /// Row for one request attempt id.
+    /// Recent row of one attempt id.
     pub fn get(&self, id: &RequestId) -> Option<RequestUsage> {
-        let rows = self.rows.lock().ok()?;
-        rows.iter().rev().find(|r| &r.request_id == id).cloned()
+        self.state().rows.get(id).cloned()
     }
 
-    /// Stats for a calendar day (UTC).
+    /// Recent rows of every attempt of the logical request `logical`, in
+    /// attempt order.
+    pub fn attempts_of(&self, logical: &RequestId) -> Vec<RequestUsage> {
+        let st = self.state();
+        let mut rows: Vec<RequestUsage> = st
+            .by_logical
+            .get(logical)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| st.rows.get(id).cloned())
+            .collect();
+        rows.sort_by_key(|r| r.accounting.attempt);
+        rows
+    }
+
+    /// Stats for a calendar day (UTC; the last 400 days are kept).
     pub fn statistics_for_day(&self, day: chrono::NaiveDate) -> UsageStatistics {
-        let mut stats = UsageStatistics::default();
-        for row in self.list() {
-            if row.started_at.date_naive() == day {
-                stats.record(&row);
-            }
-        }
-        stats
+        self.state()
+            .by_day
+            .get(&day)
+            .map(|a| a.stats.clone())
+            .unwrap_or_default()
     }
 
-    /// Filter by provider.
+    /// Stats of one provider.
     pub fn statistics_by_provider(&self, provider: &ProviderId) -> UsageStatistics {
-        let mut stats = UsageStatistics::default();
-        for row in self.list() {
-            if &row.provider == provider {
-                stats.record(&row);
-            }
-        }
-        stats
+        self.state()
+            .by_provider
+            .get(provider)
+            .map(|a| a.stats.clone())
+            .unwrap_or_default()
     }
+}
+
+/// What a settled attempt is reconciled with (see
+/// [`crate::AiClient::reconcile_attempt`]).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum Reconciliation {
+    /// Usage the provider reported later (usage API, export), priced with the
+    /// pricing registry.
+    Usage {
+        /// Reported usage of this attempt.
+        usage: Usage,
+        /// Where it comes from (kept in the audit note).
+        source: String,
+    },
+    /// Amount the provider billed for this attempt (invoice, costs API), USD.
+    Amount {
+        /// Billed amount (≥ 0).
+        amount: Decimal,
+        /// Where it comes from (kept in the audit note).
+        source: String,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn attempt(logical: RequestId, attempt: u32, charge: i64, day: u32) -> RequestUsage {
+        let at = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 10, day, 12, 0, 0).unwrap();
+        RequestUsage {
+            request_id: if attempt == 1 {
+                logical
+            } else {
+                RequestId::new()
+            },
+            provider: ProviderId::openai(),
+            account: AccountId::new("a"),
+            api_key: None,
+            model: ModelId::new("m"),
+            started_at: at,
+            finished_at: at,
+            usage: Usage {
+                prompt_tokens: 10,
+                completion_tokens: 5,
+                total_tokens: 15,
+                ..Default::default()
+            },
+            cost: None,
+            success: false,
+            latency_ms: 10 * u64::from(attempt),
+            request_json: serde_json::json!({ "messages": "secret prompt" }),
+            response_json: Some(serde_json::json!({ "text": "answer" })),
+            importance: None,
+            accounting: CostAccounting {
+                status: CostStatus::UsageUnavailable,
+                charged_cost: Some(Decimal::from(charge)),
+                logical_request_id: Some(logical),
+                attempt,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn recent_rows_are_bounded_but_statistics_count_everything() {
+        let m = UsageManager::with_capacity(3);
+        let first = RequestId::new();
+        m.record(attempt(first, 1, 1, 1));
+        for _ in 0..9 {
+            m.record(attempt(RequestId::new(), 1, 1, 2));
+        }
+        assert_eq!(m.list().len(), 3, "bounded");
+        assert!(m.get(&first).is_none(), "oldest evicted");
+        assert!(m.attempts_of(&first).is_empty(), "index evicted too");
+        let all = m.statistics();
+        assert_eq!(all.requests, 10);
+        assert_eq!(all.charged_cost, Decimal::from(10));
+        assert_eq!(all.unknown_cost_requests, 10);
+        assert_eq!(m.statistics_for_day(Utc::now().date_naive()).requests, 0);
+        let day1 = chrono::NaiveDate::from_ymd_opt(2026, 10, 1).unwrap();
+        assert_eq!(m.statistics_for_day(day1).requests, 1);
+        assert_eq!(m.statistics_by_provider(&ProviderId::openai()).requests, 10);
+    }
+
+    #[test]
+    fn rows_are_kept_without_content() {
+        let m = UsageManager::new();
+        let id = RequestId::new();
+        m.record(attempt(id, 1, 1, 1));
+        let row = m.get(&id).unwrap();
+        assert_eq!(row.request_json, serde_json::json!({}));
+        assert!(row.response_json.is_none());
+    }
+
+    #[test]
+    fn attempts_of_a_logical_request_in_attempt_order() {
+        let m = UsageManager::new();
+        let logical = RequestId::new();
+        let (a1, a2, a3) = (
+            attempt(logical, 1, 1, 1),
+            attempt(logical, 2, 2, 1),
+            attempt(logical, 3, 3, 1),
+        );
+        for r in [a3.clone(), a1, a2] {
+            m.record(r);
+        }
+        m.record(attempt(RequestId::new(), 1, 9, 1));
+        let rows = m.attempts_of(&logical);
+        assert_eq!(
+            rows.iter()
+                .map(|r| r.accounting.attempt)
+                .collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
+        assert_eq!(rows[2].request_id, a3.request_id);
+    }
+
+    #[test]
+    fn replace_moves_statistics_exactly() {
+        let m = UsageManager::new();
+        let id = RequestId::new();
+        let row = attempt(id, 1, 5, 1);
+        m.record(row.clone());
+        m.record(attempt(RequestId::new(), 2, 1, 1));
+        let before = m.statistics();
+
+        let mut fixed = row.clone();
+        fixed.accounting.status = CostStatus::Reconciled;
+        fixed.accounting.charged_cost = Some(Decimal::from(2));
+        fixed.cost = Some(crate::cost::Cost {
+            amount: Decimal::from(2),
+            ..crate::cost::Cost::zero()
+        });
+        assert!(m.replace(fixed.clone()));
+        let after = m.statistics();
+        assert_eq!(after.requests, before.requests);
+        assert_eq!(after.charged_cost, before.charged_cost - Decimal::from(3));
+        assert_eq!(after.total_cost, before.total_cost + Decimal::from(2));
+        assert_eq!(
+            after.unknown_cost_requests,
+            before.unknown_cost_requests - 1
+        );
+        assert_eq!(after.average_latency_ms, before.average_latency_ms);
+        // Recording the same attempt again replaces, never double-counts.
+        m.record(fixed);
+        assert_eq!(m.statistics().requests, before.requests);
+        assert!(
+            !m.replace(attempt(RequestId::new(), 1, 1, 1)),
+            "unknown row"
+        );
+    }
+
+    #[test]
+    fn many_attempts_stay_within_capacity() {
+        let m = UsageManager::with_capacity(1_000);
+        for _ in 0..50_000 {
+            m.record(attempt(RequestId::new(), 1, 1, 3));
+        }
+        assert_eq!(m.list().len(), 1_000);
+        assert_eq!(m.statistics().requests, 50_000);
+        assert_eq!(m.statistics().charged_cost, Decimal::from(50_000));
+    }
 
     #[test]
     fn aggregates_usage() {

@@ -142,6 +142,7 @@ pub use provider_catalog::{
 };
 pub use providers::{
     Anthropic, DeepSeek, Gemini, OpenAI, OpenAICompatible, OpenAICompatibleBuilder, OpenRouter,
+    OutputLimitParam,
 };
 pub use rate_limit::RateLimit;
 pub use retry::RetryPolicy;
@@ -149,7 +150,7 @@ pub use router::{KeySelectionStrategy, MaxCost, Router, TaskType};
 pub use secrets::{
     FileSecretStore, KeychainSecretStore, MemorySecretStore, SecretStore, SecretString,
 };
-pub use storage::{MemoryStorage, Storage};
+pub use storage::{MemoryStorage, SpendLimits, Storage};
 pub use telemetry::{AttemptReport, TelemetrySink};
 pub use types::{
     AccountId, ChatRequest, ChatResponse, ChatStream, Content, ContentPart, Currency, FinishReason,
@@ -157,8 +158,8 @@ pub use types::{
     StreamEvent, Tool, ToolCall, ToolFunction, ToolResult,
 };
 pub use usage::{
-    validate_importance, CostAccounting, CostStatus, RequestUsage, TokenBreakdown, Usage,
-    UsageManager, UsageReport, UsageRequest, UsageStatistics,
+    validate_importance, CostAccounting, CostStatus, Reconciliation, RequestUsage, TokenBreakdown,
+    Usage, UsageManager, UsageReport, UsageRequest, UsageStatistics, DEFAULT_RECENT_ATTEMPTS,
 };
 
 #[cfg(feature = "sqlite")]

@@ -326,6 +326,13 @@ pub async fn assert_invariants(client: &AiClient, calls: usize) {
                     "settled == actual"
                 )
             }
+            CostStatus::Reconciled => {
+                assert_eq!(
+                    a.charged_cost,
+                    r.cost.as_ref().map(|c| c.amount),
+                    "reconciled == the reconciled cost"
+                )
+            }
             CostStatus::Rejected => {
                 assert!(!a.dispatched, "rejected => not sent");
                 assert_eq!(a.charged_cost, Some(Decimal::ZERO));

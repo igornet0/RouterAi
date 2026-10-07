@@ -282,3 +282,62 @@ async fn run_cost_includes_every_attempt_of_a_turn() {
         .unwrap();
     assert_eq!(run.cost, worst + d(TURN_COST));
 }
+
+// ---------- no budget configured: cost is still never a silent $0 ----------
+
+#[tokio::test]
+async fn unpriced_model_is_refused_before_http_even_without_a_budget() {
+    let (server, rt) = runtime(0).await;
+    let mut agent = agent(None);
+    agent.model.model = "not-in-the-price-sheet".into();
+    let run = run(&rt, agent).await;
+
+    assert_eq!(run.status, RunStatus::Failed);
+    let error = run
+        .error
+        .as_ref()
+        .map(|e| e.to_string())
+        .unwrap_or_default();
+    assert!(error.contains("pricing is unavailable"), "{error}");
+    assert_eq!(hits(&server).await, 0, "nothing sent");
+    assert_eq!(run.cost, Decimal::ZERO, "nothing spent");
+    assert_eq!(llm_details(&run)[0]["reason"], "pricing_unavailable");
+}
+
+#[tokio::test]
+async fn missing_usage_without_a_budget_charges_the_reservation_not_zero() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "choices": [{ "message": { "role": "assistant", "content": "done" },
+                          "finish_reason": "stop" }]
+        })))
+        .mount(&server)
+        .await;
+    let provider = OpenAICompatible::builder()
+        .base_url(format!("{}/v1", server.uri()))
+        .api_key(SecretString::new("KEY_A_TEST".into()))
+        .build()
+        .unwrap();
+    let ai = AiClient::builder().provider(provider).build().unwrap();
+    ai.pricing().upsert(ModelPricing::per_million(
+        ProviderId::openai_compatible(),
+        "m",
+        d("1"),
+        d("1000"),
+    ));
+    let rt = RouterRuntime::builder()
+        .ai(Arc::new(ai))
+        .build()
+        .await
+        .unwrap();
+
+    let run = run(&rt, agent(None)).await;
+    assert_eq!(run.status, RunStatus::Completed, "{:?}", run.error);
+    let detail = &llm_details(&run)[0];
+    assert_eq!(detail["cost_status"], "usage_unavailable");
+    let estimated: Decimal = detail["estimated_cost"].as_str().unwrap().parse().unwrap();
+    assert!(estimated > Decimal::ZERO);
+    assert_eq!(run.cost, estimated, "the reservation is the run's cost");
+}

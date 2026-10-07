@@ -78,6 +78,20 @@ canonical `Usage` and `StreamEvent`s.
 * No local rate limiter / concurrency limiter: provider 429 / quota errors are
   typed (`ErrorKind::RateLimit`, `ErrorKind::ProviderQuota`) and kept separate from
   budgets.
-* `UsageManager` keeps every row of the process in memory.
+* `UsageManager` keeps only recent attempt rows (10 000 by default,
+  `AiClientBuilder::recent_attempts`, without content) and incremental
+  statistics; `logical_request_attempts` / `request_usage` answer from those
+  rows — `load_logical_request_attempts` / `get_ai_request` read storage.
+* Reconciling an attempt that is no longer among the recent rows moves the
+  ledger and storage but not this process's `stats()`; per-key statistics
+  (`ApiKeyInfo::usage`, used by `LeastUsed` / `LowestCost` selection) are not
+  adjusted by reconciliation.
+* Cross-process budgets need `SqliteStorage` (atomic reservations); with
+  `MemoryStorage` or a custom storage the budget is per `AiClient`.
+* One rate per token class: tiered (long-context) prices are not modelled — see
+  [PRICING](PRICING.md#tiered-long-context-prices).
+* A provider that bills beyond the reserved token bounds is charged its actual
+  cost; the model is then refused for budget-controlled requests
+  (`WorstCaseUnbounded`), but attempts already in flight can overrun as well.
 * Streaming tool calls are not assembled (out of scope; agents use the
   non-streaming tool loop).

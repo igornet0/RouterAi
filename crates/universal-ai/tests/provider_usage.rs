@@ -460,3 +460,58 @@ async fn unsupported_requests_fail_before_http() {
     assert_eq!(err.kind(), universal_ai::ErrorKind::Validation);
     assert_eq!(gem.received_requests().await.unwrap().len(), 0);
 }
+
+/// Usage attached to a chunk whose choice has not finished is a running count
+/// (gateways with continuous usage stats), not the final bill: a stream dropped
+/// at that point keeps its reservation instead of being charged the partial count.
+#[tokio::test]
+async fn running_usage_before_finish_is_not_final() {
+    const BODY: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":1}}\n\n\
+data: {\"choices\":[{\"delta\":{\"content\":\" there\"},\"finish_reason\":null}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\n\
+data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}\n\n\
+data: [DONE]\n\n";
+
+    // Dropped after the first text delta.
+    let (_s, c) = sse_client(BODY).await;
+    let mut s = c
+        .chat()
+        .model("m")
+        .message("hi")
+        .max_tokens(100)
+        .stream()
+        .await
+        .unwrap();
+    loop {
+        match s.next().await {
+            Some(Ok(StreamEvent::TextDelta { .. })) => break,
+            Some(Ok(_)) => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    drop(s);
+    let mut row = None;
+    for _ in 0..200 {
+        row = c.list_ai_requests(1).await.unwrap().into_iter().next();
+        if row
+            .as_ref()
+            .is_some_and(|r| r.accounting.status != CostStatus::Pending)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let row = row.unwrap();
+    assert_eq!(row.accounting.status, CostStatus::Abandoned);
+    assert_eq!(
+        row.accounting.charged_cost,
+        Some(d("0.218")),
+        "partial count is not a bill"
+    );
+
+    // Read to the end: the usage on the finishing chunk is final.
+    let (_s, c) = sse_client(BODY).await;
+    stream_all(&c).await;
+    let row = &c.list_ai_requests(1).await.unwrap()[0];
+    assert_eq!(row.accounting.status, CostStatus::Actual);
+    assert_eq!(row.accounting.charged_cost, Some(d("0.02")));
+}

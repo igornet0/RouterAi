@@ -618,3 +618,75 @@ async fn random_sequences_never_overspend() {
         assert_invariants(&c, p.calls()).await;
     }
 }
+
+// ---------- provider billed beyond the reserved bounds ----------
+
+/// The worst case assumes the provider cannot bill more tokens than reserved
+/// (input <= UTF-8 bytes + overhead, output <= `max_tokens`). A provider that does
+/// (e.g. reasoning billed outside `max_tokens`) is charged its actual cost, and
+/// the assumption is treated as falsified for that model: further
+/// budget-controlled requests to it are rejected before any HTTP.
+#[tokio::test]
+async fn usage_beyond_reserved_bounds_blocks_further_budgeted_requests() {
+    // max_tokens(100), but 500 output tokens billed: actual 0.01 + 1.0 > 0.218.
+    let p = Scripted::always("p", Step::Ok(Some(usage(10, 500))));
+    let c = client(vec![p.clone()], ClientOpts::default());
+    let first = send(&c).await.unwrap();
+    let overrun = d("1.01");
+    assert_eq!(
+        first.cost.unwrap().amount,
+        overrun,
+        "charged actual, not capped"
+    );
+    assert_eq!(spent_today(&c).await, overrun);
+
+    let err = send(&c).await.unwrap_err();
+    assert!(matches!(err, AiError::WorstCaseUnbounded { .. }), "{err:?}");
+    assert_eq!(err.kind(), ErrorKind::Pricing);
+    assert_eq!(err.budget_reason(), Some("worst_case_unbounded"));
+    assert_eq!(p.calls(), 1, "rejected before HTTP");
+    assert_eq!(spent_today(&c).await, overrun);
+    assert_invariants(&c, 1).await;
+}
+
+#[tokio::test]
+async fn input_beyond_byte_bound_blocks_the_model_but_not_others() {
+    // "hi" has an input bound of 18 tokens; 1000 billed input tokens falsify it.
+    let p = Scripted::new("p", |_, req| {
+        if req.model.as_str() == "m" {
+            Step::Ok(Some(usage(1000, 5)))
+        } else {
+            Step::Ok(Some(usage(10, 5)))
+        }
+    });
+    let c = client(vec![p.clone()], ClientOpts::default());
+    c.pricing().upsert(price("p", "other"));
+    send(&c).await.unwrap();
+    assert!(matches!(
+        send(&c).await.unwrap_err(),
+        AiError::WorstCaseUnbounded { .. }
+    ));
+    // Another model on the same provider is unaffected.
+    c.chat()
+        .model("other")
+        .message("hi")
+        .max_tokens(100)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(p.calls(), 2);
+    assert_invariants(&c, 2).await;
+}
+
+#[tokio::test]
+async fn usage_within_bounds_never_blocks() {
+    // Exactly at the bounds: 18 input tokens ("hi" bound), 100 output tokens.
+    let p = Scripted::always("p", Step::Ok(Some(usage(18, 100))));
+    let c = client(vec![p.clone()], ClientOpts::default());
+    for _ in 0..3 {
+        let r = send(&c).await.unwrap();
+        assert_eq!(r.cost.unwrap().amount, d(WORST), "worst case is tight");
+    }
+    assert_eq!(p.calls(), 3);
+    assert_invariants(&c, 3).await;
+}
