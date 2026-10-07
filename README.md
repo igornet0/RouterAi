@@ -37,6 +37,18 @@ cd web && npm install && npm run build   # refresh Console before cargo rebuild
 cd web && npm run dev                    # hot reload at :5173 (proxies API)
 ```
 
+### Server configuration: secrets
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `ROUTERAI_DATA_DIR` / `--data-dir` | `~/.routerai` | databases, key metadata, encrypted secrets |
+| `ROUTERAI_SECRETS_KEY` | — | 64 hex chars: AES-256-GCM key of `<data dir>/secrets.enc` |
+| `ROUTERAI_SECRETS_KEY_FILE` | `<data dir>/secrets.key` (created, `0600`, with a warning) | key file used when `ROUTERAI_SECRETS_KEY` is unset; keep it **outside** the data directory in production |
+
+Secrets are stored in `secrets.enc` (AES-256-GCM, owner-only). A legacy
+`secrets.bin` (XOR-obfuscated, written by older versions) is imported and deleted
+on startup — rotate those keys if the old file may have been copied.
+
 ## Web Console (P11–P13)
 
 Proves: **create → test → publish → webhook → run → sink → trace**.

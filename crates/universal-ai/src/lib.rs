@@ -147,8 +147,11 @@ pub use providers::{
 pub use rate_limit::RateLimit;
 pub use retry::RetryPolicy;
 pub use router::{KeySelectionStrategy, MaxCost, Router, TaskType};
+#[allow(deprecated)]
+pub use secrets::FileSecretStore;
 pub use secrets::{
-    FileSecretStore, KeychainSecretStore, MemorySecretStore, SecretStore, SecretString,
+    EncryptedFileSecretStore, KeychainSecretStore, MemorySecretStore, SecretStore, SecretStoreKey,
+    SecretString,
 };
 pub use storage::{MemoryStorage, SpendLimits, Storage};
 pub use telemetry::{AttemptReport, TelemetrySink};

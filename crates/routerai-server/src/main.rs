@@ -60,7 +60,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let data = args.data_dir.unwrap_or_else(data_dir);
     tokio::fs::create_dir_all(&data).await?;
-    let ai = build_ai_client(&data).await?;
+    let secrets_key = credentials::secret_store_key(&data).await?;
+    let ai = build_ai_client(&data, &secrets_key).await?;
     tracing::info!(
         data_dir = %data.display(),
         providers = ai.provider_summaries().len(),

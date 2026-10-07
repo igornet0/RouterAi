@@ -4,7 +4,7 @@
 
 - API keys are stored as `secrecy::SecretString`.
 - `Debug` / `Display` for providers, builders, and `AddKeyRequest` **redact** secrets.
-- `SecretStore` backends: `MemorySecretStore`, `FileSecretStore` (obfuscated at-rest, prefer OS keychain in prod), `KeychainSecretStore` (macOS-oriented; falls back safely in CI).
+- `SecretStore` backends: `MemorySecretStore`, `EncryptedFileSecretStore` (AES-256-GCM, owner-only `0600` file, atomic writes; wrong key / tampering is an error; used by `routerai-server`), `KeychainSecretStore` (macOS-oriented; falls back to memory). `FileSecretStore` is deprecated: XOR obfuscation, not encryption — kept only so `EncryptedFileSecretStore::import_legacy_file` can migrate old files.
 - Never log `expose_secret()` results. Tracing uses `key_id` / `provider` only.
 
 ## Errors & sanitization
