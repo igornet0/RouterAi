@@ -160,7 +160,7 @@ async fn agent_run_with_universal_ai_mock() {
 
 #[tokio::test]
 async fn sqlite_persists_event_and_run() {
-    let path = std::env::temp_dir().join(format!("routerai-{}.db", RunIdLike::new()));
+    let path = std::env::temp_dir().join(format!("routerai-{}.db", unique_id()));
     let url = format!("sqlite://{}?mode=rwc", path.display());
     let store = routerai::SqliteStore::connect(&url).await.unwrap();
     let rt = RouterRuntime::builder()
@@ -187,12 +187,12 @@ async fn sqlite_hydrates_console_state_after_restart() {
     use chrono::Utc;
     use routerai::{Dataset, SinkTarget, TestCase};
 
-    let path = std::env::temp_dir().join(format!("routerai-hydrate-{}.db", RunIdLike::new()));
+    let path = std::env::temp_dir().join(format!("routerai-hydrate-{}.db", unique_id()));
     let url = format!("sqlite://{}?mode=rwc", path.display());
 
     let agent_id;
     let event_id;
-    let case_id = format!("case_{}", RunIdLike::new());
+    let case_id = format!("case_{}", unique_id());
     let sink_id;
     {
         let store = routerai::SqliteStore::connect(&url).await.unwrap();
@@ -225,7 +225,7 @@ async fn sqlite_hydrates_console_state_after_restart() {
         .await
         .unwrap();
         rt.upsert_dataset(Dataset {
-            id: format!("ds_{}", RunIdLike::new()),
+            id: format!("ds_{}", unique_id()),
             name: "suite".into(),
             agent_id: agent_id.clone(),
             case_ids: vec![case_id.clone()],
@@ -283,11 +283,8 @@ async fn sqlite_hydrates_console_state_after_restart() {
 }
 
 // local helper without uuid dep in tests
-struct RunIdLike;
-impl RunIdLike {
-    fn new() -> String {
-        routerai::RunId::new().to_string()
-    }
+fn unique_id() -> String {
+    routerai::RunId::new().to_string()
 }
 
 #[allow(dead_code)]

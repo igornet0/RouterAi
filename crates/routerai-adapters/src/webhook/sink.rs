@@ -80,7 +80,12 @@ impl HttpWebhookSink {
         event.metadata.extra.get("reply_to").cloned()
     }
 
-    async fn post_json(&self, url: &str, secret: Option<&str>, body: &serde_json::Value) -> RouterResult<()> {
+    async fn post_json(
+        &self,
+        url: &str,
+        secret: Option<&str>,
+        body: &serde_json::Value,
+    ) -> RouterResult<()> {
         let mut req = self.client.post(url).json(body);
         if let Some(secret) = secret {
             req = req.header("X-RouterAi-Sink-Secret", secret);

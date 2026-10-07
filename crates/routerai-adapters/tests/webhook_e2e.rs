@@ -21,15 +21,15 @@ async fn webhook_roundtrip_source_to_sink() {
         .await;
 
     let rt = RouterRuntime::builder().build().await.unwrap();
-    let sink = Arc::new(
-        HttpWebhookSink::new(rt.sinks().clone(), WebhookSinkConfig::default()).unwrap(),
-    );
+    let sink =
+        Arc::new(HttpWebhookSink::new(rt.sinks().clone(), WebhookSinkConfig::default()).unwrap());
     rt.sinks().add_sink(sink).await;
 
     // Subscribe to agent.completed deliveries
-    let mut target = SinkTarget::new(format!("{}/callback", mock.uri()), vec![
-        "agent.completed".into(),
-    ]);
+    let mut target = SinkTarget::new(
+        format!("{}/callback", mock.uri()),
+        vec!["agent.completed".into()],
+    );
     target.id = "sink_test".into();
     rt.sinks().upsert_target(target).await;
 

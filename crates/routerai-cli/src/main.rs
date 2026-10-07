@@ -4,9 +4,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use routerai::{
-    published_agent, Action, AgentId, Event, Handler, RouterRuntime, Schedule,
-};
+use routerai::{published_agent, Action, AgentId, Event, Handler, RouterRuntime, Schedule};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
 
@@ -150,7 +148,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Doctor => {
             let d = rt.doctor().await;
             println!("RouterAi runtime       {}", ok(d.runtime_ok));
-            println!("Kill switch            {}", if d.kill_switch { "ON" } else { "off" });
+            println!(
+                "Kill switch            {}",
+                if d.kill_switch { "ON" } else { "off" }
+            );
             println!("Event bus              {}", ok(d.event_bus_ok));
             println!("AiClient               {}", ok(d.ai_configured));
             println!("Agents                 {}", d.agents);
@@ -252,10 +253,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Runs { action } => match action {
             RunCmd::List => {
                 for r in rt.store().list_runs(20).await? {
-                    println!(
-                        "{:<24} {:<24} {:?} ${}",
-                        r.id, r.agent_id, r.status, r.cost
-                    );
+                    println!("{:<24} {:<24} {:?} ${}", r.id, r.agent_id, r.status, r.cost);
                 }
             }
         },

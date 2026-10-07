@@ -123,10 +123,23 @@ impl Store for MemoryStore {
     }
     async fn list_events(&self, limit: usize) -> RouterResult<Vec<Event>> {
         let g = self.events.read().await;
-        Ok(g.iter().rev().take(limit).cloned().collect::<Vec<_>>().into_iter().rev().collect())
+        Ok(g.iter()
+            .rev()
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect())
     }
     async fn get_event(&self, id: &EventId) -> RouterResult<Option<Event>> {
-        Ok(self.events.read().await.iter().find(|e| &e.id == id).cloned())
+        Ok(self
+            .events
+            .read()
+            .await
+            .iter()
+            .find(|e| &e.id == id)
+            .cloned())
     }
     async fn save_handler(&self, handler: &Handler) -> RouterResult<()> {
         self.handlers
@@ -171,7 +184,7 @@ impl Store for MemoryStore {
     }
     async fn list_runs(&self, limit: usize) -> RouterResult<Vec<AgentRun>> {
         let mut v: Vec<_> = self.runs.read().await.values().cloned().collect();
-        v.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        v.sort_by_key(|a| std::cmp::Reverse(a.started_at));
         v.truncate(limit);
         Ok(v)
     }

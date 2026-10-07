@@ -81,7 +81,9 @@ impl Schedule {
                     return false;
                 };
                 // Fire if a tick exists between last and now.
-                let after = self.last_fired_at.unwrap_or(now - chrono::Duration::seconds(1));
+                let after = self
+                    .last_fired_at
+                    .unwrap_or(now - chrono::Duration::seconds(1));
                 schedule.after(&after).next().is_some_and(|t| t <= now)
             }
         }
@@ -111,9 +113,8 @@ impl Scheduler {
     pub async fn upsert(&self, schedule: Schedule) -> RouterResult<()> {
         // Validate cron early.
         if let ScheduleKind::Cron { expr } = &schedule.kind {
-            CronSchedule::from_str(expr).map_err(|e| {
-                RouterError::Invalid(format!("invalid cron `{expr}`: {e}"))
-            })?;
+            CronSchedule::from_str(expr)
+                .map_err(|e| RouterError::Invalid(format!("invalid cron `{expr}`: {e}")))?;
         }
         if let ScheduleKind::Interval { every_secs } = schedule.kind {
             if every_secs == 0 {
@@ -155,7 +156,11 @@ impl Scheduler {
     }
 
     /// Background tick loop handle.
-    pub fn spawn_ticker<F, Fut>(self, interval: Duration, mut on_due: F) -> tokio::task::JoinHandle<()>
+    pub fn spawn_ticker<F, Fut>(
+        self,
+        interval: Duration,
+        mut on_due: F,
+    ) -> tokio::task::JoinHandle<()>
     where
         F: FnMut(DueSchedule) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,

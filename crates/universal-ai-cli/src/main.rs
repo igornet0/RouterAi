@@ -151,7 +151,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Providers => {
-            println!("{:<14} {:<12} {}", "Provider", "Chat", "Capabilities");
+            println!("{:<14} {:<12} Capabilities", "Provider", "Chat");
             for p in client.provider_summaries() {
                 let caps = &p.capabilities;
                 println!(
@@ -223,8 +223,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         },
         Commands::Balance => {
             println!(
-                "{:<12} {:<12} {:<12} {}",
-                "Provider", "Currency", "Balance", "Updated"
+                "{:<12} {:<12} {:<12} Updated",
+                "Provider", "Currency", "Balance"
             );
             for p in client.provider_summaries() {
                 if !p.capabilities.supports(universal_ai::Capability::Balance) {
