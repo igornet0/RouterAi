@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Known-good toolchain; bump deliberately (new clippy lints arrive with it).
+  PINNED_TOOLCHAIN: "1.98.0"
+  # Must equal `rust-version` in Cargo.toml.
+  MSRV: "1.88"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.PINNED_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$PINNED_TOOLCHAIN" --profile minimal --component rustfmt,clippy
+          rustup default "$PINNED_TOOLCHAIN"
+      - name: rustfmt
+        run: cargo fmt --all --check
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build web/dist (embedded by routerai-server)
+        working-directory: web
+        run: npm ci && npm run build
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: lint-${{ runner.os }}-${{ env.PINNED_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ env.PINNED_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$PINNED_TOOLCHAIN" --profile minimal
+          rustup default "$PINNED_TOOLCHAIN"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build web/dist (embedded by routerai-server)
+        working-directory: web
+        run: npm ci && npm run build
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: test-${{ runner.os }}-${{ env.PINNED_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+      - name: cargo check
+        run: cargo check --workspace --all-targets --all-features --locked
+      # Unit, integration (SQLite, crash recovery, shared budget) and doc tests.
+      - name: cargo test
+        run: cargo test --workspace --all-features --locked
+
+  msrv:
+    name: MSRV (Rust ${{ env.MSRV }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: rust-version matches MSRV
+        run: grep -qx "rust-version = \"$MSRV\"" Cargo.toml
+      - name: Install Rust ${{ env.MSRV }}
+        run: |
+          rustup toolchain install "$MSRV" --profile minimal
+          rustup default "$MSRV"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Build web/dist (embedded by routerai-server)
+        working-directory: web
+        run: npm ci && npm run build
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target
+          key: msrv-${{ runner.os }}-${{ env.MSRV }}-${{ hashFiles('Cargo.lock') }}
+      - name: cargo test
+        run: cargo test --workspace --all-features --locked

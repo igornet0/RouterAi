@@ -37,6 +37,20 @@ cd web && npm install && npm run build   # refresh Console before cargo rebuild
 cd web && npm run dev                    # hot reload at :5173 (proxies API)
 ```
 
+### Supported toolchains
+
+| Toolchain | Status | Checked by |
+|---|---|---|
+| Rust **1.88** (MSRV, `rust-version`) | supported | CI `msrv`: `cargo test --locked` on Linux |
+| Rust **1.98.0** (pinned, known good) | supported | CI `lint` (fmt, clippy `-D warnings`) and `test` on Linux + macOS |
+| latest stable | expected to work | not gated (new clippy lints may appear) |
+
+The MSRV is set by the locked dependencies (`icu_*`, `home` require 1.88), not by
+RouterAi's own code; older toolchains cannot even parse their manifests. It is
+proven against the committed `Cargo.lock` — every CI cargo command runs with
+`--locked`, so a dependency update that raises it fails the `msrv` job.
+Building `routerai-server` needs `web/dist` (Node 22: `cd web && npm ci && npm run build`).
+
 ### Server configuration: prices and secrets
 
 | Setting | Default | Meaning |
