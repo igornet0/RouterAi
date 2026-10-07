@@ -9,6 +9,7 @@ version in `PRAGMA user_version` (`universal_ai::storage::SQLITE_SCHEMA_VERSION`
 | 1 (implicit, column-detected) | `request_json`, `response_json`, `importance`; accounting: `cost_status`, `estimated_cost`, `charged_cost`, `budget_scope`, `logical_request_id`, `attempt`, `rejection` |
 | 2 | `reserved_cost`, `retry`, `dispatched`, `cost_note`, `error_kind`, `cached_tokens`, `cache_creation_tokens`, `reasoning_tokens`, `other_tokens`, `cost_json`; index on `cost_status`; `user_version = 2` |
 | 3 | `spend_totals` (running committed spend per UTC day / month, global and per scope), rebuilt from the rows once, inside a `BEGIN IMMEDIATE` transaction that re-checks `user_version` (concurrent openers cannot build it twice); `user_version = 3` |
+| 4 | `price_versions` (price sheet JSON by content-hash version) and `requests.pricing_version`; v3 rows keep `NULL` (priced before versions existed: reconciliation uses the current sheet and notes it); totals unchanged; `user_version = 4` |
 
 Rules:
 
@@ -21,6 +22,7 @@ Rules:
   an older binary must not reinterpret — and possibly undercount — newer rows.
   A v2 binary opening a v3 database is refused for the same reason (it would
   write rows without updating `spend_totals`); stop old processes before
-  upgrading (`schema_v2_database_gets_totals_rebuilt_from_its_rows`).
+  upgrading (`schema_v2_database_gets_totals_rebuilt_from_its_rows`). A v3
+  binary refuses a v4 database (`schema_v3_database_is_migrated`).
 * `enable_wal()` changes the journal mode persistently; it is not a schema
   change and older binaries can open WAL databases.

@@ -13,6 +13,7 @@ use crate::account::{Account, AccountStatus};
 use crate::balance::Balance;
 use crate::cost::Cost;
 use crate::error::{sanitize_message, AiError, AiResult};
+use crate::pricing::ModelPricing;
 use crate::storage::{SpendLimits, Storage};
 use crate::types::{AccountId, Currency, KeyId, ModelId, ProviderId, RequestId};
 use crate::usage::{validate_importance, CostAccounting, RequestUsage, Usage};
@@ -89,13 +90,20 @@ impl SqliteStorage {
                 response_json TEXT,
                 importance INTEGER
             );
+            CREATE TABLE IF NOT EXISTS price_versions (
+                version TEXT PRIMARY KEY,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                pricing_json TEXT NOT NULL,
+                saved_at TEXT NOT NULL
+            );
             "#,
         )
         .execute(&self.pool)
         .await
         .map_err(storage_err)?;
 
-        // Additive, idempotent column migrations (v0 → v2). Old rows keep NULLs,
+        // Additive, idempotent column migrations (v0 → v4). Old rows keep NULLs,
         // which read back as "unknown" — never as a zero charge.
         for sql in [
             // v1: content columns.
@@ -121,6 +129,8 @@ impl SqliteStorage {
             "ALTER TABLE requests ADD COLUMN reasoning_tokens INTEGER",
             "ALTER TABLE requests ADD COLUMN other_tokens TEXT",
             "ALTER TABLE requests ADD COLUMN cost_json TEXT",
+            // v4: price sheet each attempt was priced with (see `price_versions`).
+            "ALTER TABLE requests ADD COLUMN pricing_version TEXT",
         ] {
             if let Err(e) = sqlx::query(sql).execute(&self.pool).await {
                 let msg = e.to_string();
@@ -227,6 +237,7 @@ impl SqliteStorage {
             cost_note: text("cost_note"),
             error_kind: text("error_kind")
                 .and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok()),
+            pricing_version: text("pricing_version"),
         };
         // Full breakdown when present; legacy rows only stored the total.
         let cost = text("cost_json")
@@ -275,7 +286,7 @@ impl SqliteStorage {
 }
 
 /// Current schema version (`PRAGMA user_version`).
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 fn storage_err(e: sqlx::Error) -> AiError {
     AiError::Storage {
@@ -327,9 +338,10 @@ async fn upsert_row(conn: &mut SqliteConnection, row: &RequestUsage) -> AiResult
          cost_status, estimated_cost, charged_cost, budget_scope, logical_request_id,
          attempt, rejection,
          reserved_cost, retry, dispatched, cost_note, error_kind,
-         cached_tokens, cache_creation_tokens, reasoning_tokens, other_tokens, cost_json)
+         cached_tokens, cache_creation_tokens, reasoning_tokens, other_tokens, cost_json,
+         pricing_version)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(row.request_id.to_string())
@@ -365,6 +377,7 @@ async fn upsert_row(conn: &mut SqliteConnection, row: &RequestUsage) -> AiResult
     .bind(row.usage.reasoning_tokens.map(|v| v as i64))
     .bind(other_tokens)
     .bind(cost_json)
+    .bind(a.pricing_version.clone())
     .execute(&mut *conn)
     .await
     .map_err(storage_err)?;
@@ -545,6 +558,48 @@ impl Storage for SqliteStorage {
 
     fn atomic_reservations(&self) -> bool {
         true
+    }
+
+    async fn save_pricing_version(&self, pricing: &ModelPricing) -> AiResult<()> {
+        let json = serde_json::to_string(pricing).map_err(|e| AiError::Serialization {
+            message: e.to_string(),
+        })?;
+        // A version is a content hash: an existing row already holds this sheet.
+        sqlx::query(
+            "INSERT OR IGNORE INTO price_versions \
+             (version, provider, model, pricing_json, saved_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(pricing.version())
+        .bind(pricing.provider.to_string())
+        .bind(pricing.model.to_string())
+        .bind(json)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await
+        .map_err(storage_err)?;
+        Ok(())
+    }
+
+    async fn get_pricing_version(&self, version: &str) -> AiResult<Option<ModelPricing>> {
+        let json: Option<String> =
+            sqlx::query_scalar("SELECT pricing_json FROM price_versions WHERE version = ?")
+                .bind(version)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(storage_err)?;
+        let Some(json) = json else {
+            return Ok(None);
+        };
+        // Fail closed: a sheet that does not hash to its key is not the one the
+        // attempt was priced with.
+        let corrupt = || AiError::Storage {
+            message: format!("corrupt price version {version}"),
+        };
+        let pricing: ModelPricing = serde_json::from_str(&json).map_err(|_| corrupt())?;
+        if pricing.version() != version {
+            return Err(corrupt());
+        }
+        Ok(Some(pricing))
     }
 
     async fn list_attempts(&self, logical: &RequestId) -> AiResult<Vec<RequestUsage>> {

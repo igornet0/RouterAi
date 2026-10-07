@@ -74,8 +74,30 @@ source = "https://openai.com/api/pricing"
 as_of = "2026-10-01"                # last verified; entries older than 90 days are logged
 ```
 
-Unknown keys, float or negative rates, missing `source` / `as_of`, future dates
-and duplicate entries stop the server at startup. A self-hosted model is free
+A model whose price depends on the prompt size lists tiers above the base
+rates and says how they apply (`whole_request` or `marginal`, no default — see
+[PRICING](crates/universal-ai/docs/PRICING.md#tiered-long-context-prices)):
+
+```toml
+[[price]]
+provider = "gemini"
+model = "gemini-2.5-pro"
+input_per_million = "1.25"          # illustrative rates: check the provider's page
+output_per_million = "10"
+tier_mode = "whole_request"
+source = "https://ai.google.dev/pricing"
+as_of = "2026-10-01"
+
+[[price.tier]]
+above_input_tokens = 200000         # strictly more than 200 000 input tokens
+input_per_million = "2.50"
+output_per_million = "15"
+```
+
+Unknown keys, float or negative rates, missing `source` / `as_of`, future dates,
+duplicate entries and ambiguous tiers (no `tier_mode`, thresholds not
+increasing, a tier missing an optional rate its base sets) stop the server at
+startup. A self-hosted model is free
 only if its entry says `"0"`. Agent requests are always cost-bounded: without a
 price — or without `max_tokens` / a known model output limit — they are refused
 before sending, and an attempt whose cost cannot be determined is charged its

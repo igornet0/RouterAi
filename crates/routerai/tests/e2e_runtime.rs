@@ -112,6 +112,7 @@ async fn agent_run_with_universal_ai_mock() {
         cache_write_per_million: None,
         reasoning_per_million: None,
         effective_from: chrono::Utc::now(),
+        tiering: None,
     });
 
     let rt = RouterRuntime::builder()

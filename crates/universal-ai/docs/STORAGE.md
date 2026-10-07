@@ -22,11 +22,16 @@ accounts. Budget totals are **derived from rows** (`spend_in_window` sums
   replaying a write is idempotent, and totals always equal the rows
   (`shared_budget.rs::running_totals_equal_the_rows_after_mixed_traffic`).
   Budget-period reads are O(1); other windows scan the rows.
+* `price_versions(version, provider, model, pricing_json, saved_at)` keeps every
+  price sheet an attempt was priced with, by content-hash version. A sheet is
+  written before the first row that references it (once per sheet and process:
+  no extra write on the hot path), and `INSERT OR IGNORE` makes the write
+  idempotent. Reading a sheet that no longer hashes to its version fails.
 * If a settlement write fails, the error is logged and the reservation stays
   charged (in memory and in the persisted `Pending` row).
 * Orphaned `Pending` rows: see [BUDGETS](BUDGETS.md#pending-requests-restart-crashes).
 
-## Columns (schema v3)
+## Columns (schema v4)
 
 `requests`: ids, provider, account, `api_key` (record id), model, timestamps,
 token counts (`prompt_tokens`, `completion_tokens`, `total_tokens`,
@@ -35,7 +40,7 @@ token counts (`prompt_tokens`, `completion_tokens`, `total_tokens`,
 `request_json` / `response_json` (unless content storage is disabled), `importance`,
 accounting (`cost_status`, `estimated_cost`, `reserved_cost`, `charged_cost`,
 `budget_scope`, `logical_request_id`, `attempt`, `retry`, `dispatched`,
-`rejection`, `cost_note`, `error_kind`). Money is stored as decimal text and summed
+`rejection`, `cost_note`, `error_kind`, `pricing_version`). Money is stored as decimal text and summed
 as `Decimal` (never floats).
 
 ## Performance

@@ -76,11 +76,75 @@ bounds and every combination of priced classes.
 
 ## Tiered (long-context) prices
 
-`ModelPricing` has one rate per token class. Models whose price depends on the
-prompt size (e.g. a higher rate above 200k input tokens) cannot be expressed:
-both the worst case and the "actual" cost use the registered rate. Register the
-**highest** tier's rates for such models if prompts can cross the threshold —
-otherwise `Actual` understates the provider's bill.
+The rates of `ModelPricing` are the **base tier**. A model whose price depends on
+the prompt size adds explicit `Tiering` — a sheet without it is a flat price,
+nothing else is assumed:
+
+```rust,ignore
+let mut p = ModelPricing::per_million(ProviderId::gemini(), "gemini-x", base_in, base_out);
+p.tiering = Some(Tiering {
+    mode: TierMode::WholeRequest, // required: there is no default mode
+    tiers: vec![PriceTier {
+        above_input_tokens: 200_000,
+        input_per_million: in_above,
+        output_per_million: out_above,
+        cached_input_per_million: None, // exactly the optional rates the base sets
+        cache_write_per_million: None,
+        reasoning_per_million: None,
+    }],
+});
+client.pricing().try_upsert(p)?;
+```
+
+**Measure.** The tier is chosen by the request's input tokens,
+`Usage::prompt_tokens` — cache reads and writes included. A tier applies when
+input tokens are **strictly greater** than its threshold: with 200 000, a
+200 000-token prompt is billed at the lower tier, 200 001 at the higher one.
+
+**Modes** (`TierMode`):
+
+| Mode | Input-side tokens | Output / reasoning |
+|---|---|---|
+| `WholeRequest` | every token at the rates of the tier the prompt falls into ("0–200k → A, > 200k → B") | that tier's rates |
+| `Marginal` | per band: the first 200k at A, the rest at B; inside the prompt, cache reads come first, then cache writes, then uncached input | the rates of the tier the whole prompt reaches |
+
+`Marginal` is RouterAi's definition, not a provider's: check that it matches how
+the provider actually bills before choosing it.
+
+**Validation** (`validate`, `try_upsert`; the server's `pricing.toml` uses the
+same rules): thresholds positive and strictly increasing; a tiered sheet has base
+input and output rates; each tier states exactly the optional rates (cached
+input, cache write, reasoning) the base states — a tier never inherits a rate;
+no negative rate in any tier.
+
+**Worst case.** The tiers *reachable* by the input bound are the base and every
+tier whose threshold is below the bound. The reservation uses the highest
+input-side and output-side rates over all reachable tiers, so it covers both
+modes — and a cheaper upper tier never lowers it. `explain()` says which tiers
+were reachable. The property test runs half of its cases on random tiered sheets
+(1–3 tiers, both modes, rates not necessarily increasing).
+
+`Cost::tier_above_input_tokens` records the highest tier a settled request
+reached (`None` = base / flat).
+
+## Price versions (history)
+
+A price sheet's `version()` is a content hash (`pv1-…`): identical sheets share
+it, any change — a rate, a tier, the mode, `effective_from` — gives a new one.
+
+* The budget gate looks the price up **once** per attempt; the estimate, the
+  reservation and the settlement all use that sheet, even if the registry is
+  updated while the attempt is in flight.
+* The attempt row records `CostAccounting::pricing_version`, and the sheet itself
+  is saved by the storage (`Storage::save_pricing_version`, SQLite table
+  `price_versions`) **before** the first row that references it.
+* `reconcile_attempt` with `Reconciliation::Usage` reprices with the attempt's
+  own sheet — from the registry's history, else from storage after a restart —
+  never with today's price. A stored sheet that no longer hashes to its version
+  is refused (`corrupt price version`). Rows from before price versions existed
+  are repriced at the current sheet; the audit note says so, and the row then
+  records that version.
+* `PricingRegistry::get_version` returns any sheet the registry has held.
 
 ## Multimodal input
 

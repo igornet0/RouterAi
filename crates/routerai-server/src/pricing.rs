@@ -20,6 +20,27 @@
 //! `reasoning_per_million` (see `universal_ai::ModelPricing::rate` for how a
 //! missing one is handled). A self-hosted model is free only when its sheet says
 //! so (`"0"` rates).
+//!
+//! A model whose price depends on the prompt size lists its tiers above the base
+//! rates, and says how they apply — there is no default:
+//!
+//! ```toml
+//! [[price]]
+//! provider = "gemini"
+//! model = "gemini-2.5-pro"
+//! input_per_million = "1.25"            # prompts up to 200 000 input tokens
+//! output_per_million = "10"
+//! tier_mode = "whole_request"           # or "marginal" (see universal_ai::TierMode)
+//! source = "https://ai.google.dev/pricing"
+//! as_of = "2026-10-01"
+//!
+//! [[price.tier]]
+//! above_input_tokens = 200000           # strictly more than 200 000 input tokens
+//! input_per_million = "2.50"
+//! output_per_million = "15"
+//! ```
+//!
+//! A tier states exactly the optional rates its base states.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -27,7 +48,7 @@ use std::path::{Path, PathBuf};
 use chrono::{NaiveDate, TimeZone, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use universal_ai::{AiClient, ModelId, ModelPricing, ProviderId};
+use universal_ai::{AiClient, ModelId, ModelPricing, PriceTier, ProviderId, TierMode, Tiering};
 
 /// Rates older than this are reported (not rejected) at startup.
 const STALE_AFTER_DAYS: i64 = 90;
@@ -53,6 +74,9 @@ pub struct PriceEntry {
     pub cached_input_per_million: Option<Decimal>,
     pub cache_write_per_million: Option<Decimal>,
     pub reasoning_per_million: Option<Decimal>,
+    /// Prompt-size tiers above these rates (`None` = flat price).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tiering: Option<Tiering>,
     /// Where the rates were taken from (URL, contract, invoice, …).
     pub source: String,
     /// When the rates were last verified.
@@ -70,6 +94,7 @@ impl PriceEntry {
             cache_write_per_million: self.cache_write_per_million,
             reasoning_per_million: self.reasoning_per_million,
             effective_from: Utc.from_utc_datetime(&self.as_of.and_hms_opt(0, 0, 0).unwrap()),
+            tiering: self.tiering.clone(),
         }
     }
 }
@@ -93,8 +118,22 @@ struct RawEntry {
     cached_input_per_million: Option<String>,
     cache_write_per_million: Option<String>,
     reasoning_per_million: Option<String>,
+    tier_mode: Option<String>,
+    #[serde(default)]
+    tier: Vec<RawTier>,
     source: String,
     as_of: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTier {
+    above_input_tokens: u64,
+    input_per_million: String,
+    output_per_million: String,
+    cached_input_per_million: Option<String>,
+    cache_write_per_million: Option<String>,
+    reasoning_per_million: Option<String>,
 }
 
 fn rate(entry: usize, field: &str, value: &str) -> Result<Decimal, String> {
@@ -139,17 +178,83 @@ pub fn parse_price_sheet(text: &str, today: NaiveDate) -> Result<PriceSheet, Str
         }
         let opt =
             |field: &str, v: &Option<String>| v.as_deref().map(|v| rate(i, field, v)).transpose();
-        prices.push(PriceEntry {
+        let tiering = match (e.tier_mode.as_deref().map(str::trim), e.tier.is_empty()) {
+            (None, true) => None,
+            (None, false) => {
+                return Err(format!(
+                    "price[{i}] ({provider}/{model}): tier_mode is required with tiers \
+                     (\"whole_request\" or \"marginal\")"
+                ))
+            }
+            (Some(_), true) => {
+                return Err(format!(
+                    "price[{i}] ({provider}/{model}): tier_mode without [[price.tier]]"
+                ))
+            }
+            (Some(mode), false) => {
+                let mode = match mode {
+                    "whole_request" => TierMode::WholeRequest,
+                    "marginal" => TierMode::Marginal,
+                    other => {
+                        return Err(format!(
+                            "price[{i}] ({provider}/{model}): tier_mode {other:?} is not \
+                             \"whole_request\" or \"marginal\""
+                        ))
+                    }
+                };
+                let mut tiers = Vec::with_capacity(e.tier.len());
+                for (t, raw) in e.tier.iter().enumerate() {
+                    let field = |name: &str| format!("tier[{t}].{name}");
+                    let opt = |name: &str, v: &Option<String>| {
+                        v.as_deref().map(|v| rate(i, &field(name), v)).transpose()
+                    };
+                    tiers.push(PriceTier {
+                        above_input_tokens: raw.above_input_tokens,
+                        input_per_million: rate(
+                            i,
+                            &field("input_per_million"),
+                            &raw.input_per_million,
+                        )?,
+                        output_per_million: rate(
+                            i,
+                            &field("output_per_million"),
+                            &raw.output_per_million,
+                        )?,
+                        cached_input_per_million: opt(
+                            "cached_input_per_million",
+                            &raw.cached_input_per_million,
+                        )?,
+                        cache_write_per_million: opt(
+                            "cache_write_per_million",
+                            &raw.cache_write_per_million,
+                        )?,
+                        reasoning_per_million: opt(
+                            "reasoning_per_million",
+                            &raw.reasoning_per_million,
+                        )?,
+                    });
+                }
+                Some(Tiering { mode, tiers })
+            }
+        };
+        let entry = PriceEntry {
             input_per_million: rate(i, "input_per_million", &e.input_per_million)?,
             output_per_million: rate(i, "output_per_million", &e.output_per_million)?,
             cached_input_per_million: opt("cached_input_per_million", &e.cached_input_per_million)?,
             cache_write_per_million: opt("cache_write_per_million", &e.cache_write_per_million)?,
             reasoning_per_million: opt("reasoning_per_million", &e.reasoning_per_million)?,
+            tiering,
             source: e.source.trim().to_string(),
             as_of,
             provider,
             model,
-        });
+        };
+        // Tier thresholds and rate sets are checked by the library's own rules.
+        entry
+            .to_model_pricing()
+            .validate()
+            .map_err(|err| format!("price[{i}]: {err}"))?;
+        prices.push(entry);
     }
     Ok(PriceSheet { prices })
 }
@@ -293,6 +398,99 @@ as_of = "2026-10-07"
             "[[price]]\nprovider = \"openai\"\nmodel = \"m\"\noutput_per_million = \"2\"\n\
              source = \"s\"\nas_of = \"2026-10-01\"\n",
             "input_per_million",
+        );
+    }
+
+    const TIERED: &str = r#"
+[[price]]
+provider = "gemini"
+model = "gemini-2.5-pro"
+input_per_million = "1.25"
+output_per_million = "10"
+cached_input_per_million = "0.31"
+tier_mode = "whole_request"
+source = "https://ai.google.dev/pricing"
+as_of = "2026-10-01"
+
+[[price.tier]]
+above_input_tokens = 200000
+input_per_million = "2.50"
+output_per_million = "15"
+cached_input_per_million = "0.625"
+"#;
+
+    #[test]
+    fn tiers_are_parsed_exactly_and_reach_the_registry() {
+        let sheet = parse_price_sheet(TIERED, today()).unwrap();
+        let tiering = sheet.prices[0].tiering.clone().unwrap();
+        assert_eq!(tiering.mode, TierMode::WholeRequest);
+        assert_eq!(tiering.tiers.len(), 1);
+        assert_eq!(tiering.tiers[0].above_input_tokens, 200_000);
+        assert_eq!(
+            tiering.tiers[0].cached_input_per_million,
+            Some("0.625".parse().unwrap())
+        );
+        let marginal = TIERED.replace("whole_request", "marginal");
+        let sheet_m = parse_price_sheet(&marginal, today()).unwrap();
+        assert_eq!(
+            sheet_m.prices[0].tiering.as_ref().unwrap().mode,
+            TierMode::Marginal
+        );
+
+        let ai = AiClient::builder().allow_empty_providers().build().unwrap();
+        apply_price_sheet(&ai, &sheet).unwrap();
+        let p = ai
+            .pricing()
+            .get_price_sync(&ProviderId::new("gemini"), &ModelId::new("gemini-2.5-pro"))
+            .unwrap();
+        assert_eq!(p.tiering, Some(tiering));
+        // GET /api/v1/pricing shows the tiers.
+        let json = serde_json::to_value(&sheet).unwrap();
+        assert_eq!(json["prices"][0]["tiering"]["mode"], "whole_request");
+        // A flat entry has no tiering key.
+        let flat = serde_json::to_value(parse_price_sheet(VALID, today()).unwrap()).unwrap();
+        assert!(flat["prices"][0].get("tiering").is_none());
+    }
+
+    #[test]
+    fn ambiguous_tiers_are_rejected() {
+        rejects(
+            &TIERED.replace("tier_mode = \"whole_request\"\n", ""),
+            "tier_mode is required",
+        );
+        let no_tiers = TIERED.split("[[price.tier]]").next().unwrap();
+        rejects(no_tiers, "tier_mode without [[price.tier]]");
+        rejects(
+            &TIERED.replace("whole_request", "per_token"),
+            "is not \"whole_request\" or \"marginal\"",
+        );
+        rejects(
+            &TIERED.replace("above_input_tokens = 200000", "above_input_tokens = 0"),
+            "must be above 0",
+        );
+        rejects(
+            &format!(
+                "{TIERED}\n[[price.tier]]\nabove_input_tokens = 100000\n\
+                 input_per_million = \"5\"\noutput_per_million = \"20\"\n\
+                 cached_input_per_million = \"1\"\n"
+            ),
+            "must be above 200000",
+        );
+        // Rates are never inherited from the base.
+        rejects(
+            &TIERED.replace("cached_input_per_million = \"0.625\"\n", ""),
+            "cached_input_per_million must be set exactly when the base rates set it",
+        );
+        rejects(
+            &TIERED.replace(
+                "output_per_million = \"15\"",
+                "output_per_million = \"-15\"",
+            ),
+            "tier[0].output_per_million: negative",
+        );
+        rejects(
+            &format!("{TIERED}reasoning_per_milion = \"1\"\n"),
+            "unknown field",
         );
     }
 

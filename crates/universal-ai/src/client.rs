@@ -23,14 +23,16 @@ use crate::budget::{
 use crate::capability::{Capability, ProviderCapabilities};
 use crate::config::MissingUsagePolicy;
 use crate::config::{AiConfig, BudgetPolicy};
-use crate::cost::{CostEstimate, CostManager, OutputBoundSource};
+use crate::cost::{
+    cost_from_pricing, estimate_from_pricing, CostEstimate, CostManager, OutputBoundSource,
+};
 use crate::error::{AiError, AiResult};
 use crate::events::{AiEvent, EventBus, RequestFailed, RequestStarted};
 use crate::execution::{metered_stream, AttemptMeter, Core};
 use crate::health::{HealthMonitor, HealthStatus};
 use crate::http::{HttpClient, HttpConfig};
 use crate::models::{ModelRegistry, ModelsApi};
-use crate::pricing::PricingRegistry;
+use crate::pricing::{ModelPricing, PricingRegistry};
 use crate::provider::{DynProvider, Provider, ProviderCredential};
 use crate::provider_catalog::build_provider_template;
 use crate::router::Router;
@@ -220,6 +222,7 @@ impl AiClientBuilder {
             telemetry: Arc::clone(&telemetry),
             store_content: self.config.store_request_content,
             unbounded: Default::default(),
+            pricing_journal: crate::execution::PricingJournal::new(Arc::clone(&storage)),
         });
 
         Ok(AiClient {
@@ -577,15 +580,48 @@ impl AiClient {
             CostStatus::Rejected => return invalid(format!("attempt {attempt_id} was never sent")),
             _ => {}
         }
+        let mut price_note = String::new();
         let (cost, usage, source) = match with {
             Reconciliation::Usage { usage, source } => {
-                let cost = self
-                    .cost
-                    .price(&row.provider, &row.model, &usage)
-                    .map_err(|_| AiError::PricingUnavailable {
-                        provider: row.provider.clone(),
-                        model: row.model.clone(),
-                    })?;
+                let unavailable = || AiError::PricingUnavailable {
+                    provider: row.provider.clone(),
+                    model: row.model.clone(),
+                };
+                // Reprice with the sheet the attempt was priced with — never with
+                // whatever the registry holds today. Rows from before price
+                // versions existed fall back to the current sheet, and say so.
+                let sheet = match row.accounting.pricing_version.clone() {
+                    Some(v) => {
+                        let sheet = match self.cost.pricing().get_version(&v) {
+                            Some(p) => Some(p),
+                            None => self.storage.get_pricing_version(&v).await?,
+                        };
+                        price_note = format!("; price {v}");
+                        sheet.ok_or_else(|| {
+                            tracing::warn!(
+                                attempt_id = %attempt_id,
+                                pricing_version = %v,
+                                "price sheet of the attempt is not stored"
+                            );
+                            unavailable()
+                        })?
+                    }
+                    None => {
+                        let sheet = self
+                            .cost
+                            .pricing()
+                            .get_price_sync(&row.provider, &row.model)
+                            .ok_or_else(unavailable)?;
+                        price_note = format!(
+                            "; price {} (current: the attempt had no recorded price)",
+                            sheet.version()
+                        );
+                        self.core.pricing_journal.ensure(&sheet).await?;
+                        row.accounting.pricing_version = Some(sheet.version());
+                        sheet
+                    }
+                };
+                let cost = cost_from_pricing(&sheet, &usage).map_err(|_| unavailable())?;
                 (cost, Some(usage), source)
             }
             Reconciliation::Amount { amount, source } => {
@@ -617,7 +653,7 @@ impl AiClient {
         }
         let adjustment = cost.amount - previous;
         row.accounting.cost_note = Some(format!(
-            "{note_head} previously {:?} charged {previous}; adjustment {adjustment}",
+            "{note_head} previously {:?} charged {previous}; adjustment {adjustment}{price_note}",
             row.accounting.status
         ));
         row.accounting.status = CostStatus::Reconciled;
@@ -967,16 +1003,23 @@ impl AiClient {
         budget: &RequestBudget,
         ctx: &AttemptCtx,
         row: &mut RequestUsage,
-    ) -> AiResult<(Decimal, Option<u64>)> {
+    ) -> AiResult<(Decimal, Option<u64>, Option<ModelPricing>)> {
         let controlled = ctx.controlled;
         let bound = output_bound(&self.models, provider_id, request);
-        let estimate = bound.as_ref().ok().and_then(|b| {
-            self.cost
-                .estimate_bounds(provider_id, &request.model, input_bound(request), Some(*b))
-        });
+        // One lookup: the estimate, the reservation and the settlement all use
+        // this sheet, even if the registry changes while the attempt is in flight.
+        let pricing = self
+            .cost
+            .pricing()
+            .get_price_sync(provider_id, &request.model);
+        let estimate = match (&bound, &pricing) {
+            (Ok(b), Some(p)) => estimate_from_pricing(p, input_bound(request), Some(*b)),
+            _ => None,
+        };
         row.accounting.estimated_cost = estimate.as_ref().map(|e| e.total);
+        row.accounting.pricing_version = pricing.as_ref().map(ModelPricing::version);
         if !controlled {
-            return Ok((Decimal::ZERO, bound.ok().map(|(n, _)| n)));
+            return Ok((Decimal::ZERO, bound.ok().map(|(n, _)| n), pricing));
         }
         if self.core.is_unbounded(provider_id, &request.model) {
             return Err(AiError::WorstCaseUnbounded {
@@ -1038,8 +1081,12 @@ impl AiClient {
             monthly: self.config.budget.max_monthly_cost,
             scope_daily: budget.scope.as_ref().and_then(|s| s.daily_limit),
         };
+        if let Some(p) = &pricing {
+            // The reservation row references the sheet: store the sheet first.
+            self.core.pricing_journal.ensure(p).await?;
+        }
         self.ledger.reserve(row, limits).await?;
-        Ok((total, Some(tokens)))
+        Ok((total, Some(tokens), pricing))
     }
 
     /// Record an attempt rejected before dispatch (audit trail, nothing charged).
@@ -1302,7 +1349,7 @@ impl AiClient {
             request_json,
             &opts.budget,
         );
-        let (reserved, output_bound) = match self
+        let (reserved, output_bound, pricing) = match self
             .preflight(provider_id, &mut req, &opts.budget, ctx, &mut row)
             .await
         {
@@ -1319,6 +1366,7 @@ impl AiClient {
             ctx.controlled,
             started,
             (input_bound(&req).total(), output_bound),
+            pricing,
         );
         let span = tracing::info_span!(
             "ai.attempt",

@@ -1,6 +1,7 @@
 //! Property tests (deterministic generator, thousands of cases):
 //! cost >= 0, worst-case estimate >= actual cost for every usage within the
-//! bounds, unknown never silently priced, settlement writes are idempotent.
+//! bounds (flat and tiered prices, both tier modes), unknown never silently
+//! priced, settlement writes are idempotent.
 
 mod common;
 
@@ -9,7 +10,8 @@ use common::Rng;
 use rust_decimal::Decimal;
 use universal_ai::{
     AccountId, CostAccounting, CostManager, CostStatus, MemoryStorage, ModelId, ModelPricing,
-    PricingRegistry, ProviderId, RequestId, RequestUsage, Storage, Usage,
+    PriceTier, PricingRegistry, ProviderId, RequestId, RequestUsage, Storage, TierMode, Tiering,
+    Usage,
 };
 
 fn rate(rng: &mut Rng) -> Decimal {
@@ -25,6 +27,39 @@ fn pricing(rng: &mut Rng) -> ModelPricing {
     p.cached_input_per_million = opt_rate(rng);
     p.cache_write_per_million = opt_rate(rng);
     p.reasoning_per_million = opt_rate(rng);
+    p
+}
+
+/// 1–3 tiers with random thresholds (within the generated input bounds) and
+/// random rates — not necessarily increasing — in a random mode.
+fn tiered_pricing(rng: &mut Rng) -> ModelPricing {
+    let mut p = pricing(rng);
+    let mut above = 0;
+    let mut tiers = Vec::new();
+    for _ in 0..1 + rng.below(3) {
+        above += 1 + rng.below(40_000);
+        let mut same = |base: Option<Decimal>| base.map(|_| rate(rng));
+        let cached = same(p.cached_input_per_million);
+        let cache_write = same(p.cache_write_per_million);
+        let reasoning = same(p.reasoning_per_million);
+        tiers.push(PriceTier {
+            above_input_tokens: above,
+            input_per_million: rate(rng),
+            output_per_million: rate(rng),
+            cached_input_per_million: cached,
+            cache_write_per_million: cache_write,
+            reasoning_per_million: reasoning,
+        });
+    }
+    p.tiering = Some(Tiering {
+        mode: if rng.below(2) == 0 {
+            TierMode::WholeRequest
+        } else {
+            TierMode::Marginal
+        },
+        tiers,
+    });
+    p.validate().expect("generated tiers are valid");
     p
 }
 
@@ -50,8 +85,13 @@ fn usage_within(rng: &mut Rng, input_bound: u64, output_bound: u64) -> Usage {
 fn estimate_dominates_any_cost_within_bounds_and_cost_is_non_negative() {
     let mut rng = Rng(0xDEAD_BEEF_CAFE_F00D);
     let mut priced = 0;
-    for _ in 0..5_000 {
-        let p = pricing(&mut rng);
+    for case in 0..10_000 {
+        // Every other case is tiered.
+        let p = if case % 2 == 0 {
+            pricing(&mut rng)
+        } else {
+            tiered_pricing(&mut rng)
+        };
         let reg = PricingRegistry::new();
         reg.upsert(p.clone());
         let mgr = CostManager::new(reg);
@@ -88,7 +128,7 @@ fn estimate_dominates_any_cost_within_bounds_and_cost_is_non_negative() {
             }
         }
     }
-    assert!(priced > 10_000, "generator covers priced cases");
+    assert!(priced > 20_000, "generator covers priced cases");
 }
 
 #[test]

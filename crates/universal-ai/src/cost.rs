@@ -12,7 +12,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AiError, AiResult};
-use crate::pricing::{ModelPricing, PricingRegistry, TokenClass};
+use crate::pricing::{ModelPricing, PricingRegistry, TierMode, TierRates, TokenClass};
 use crate::types::{Currency, ModelId, ProviderId};
 use crate::usage::Usage;
 
@@ -35,6 +35,10 @@ pub struct Cost {
     /// Reasoning portion.
     #[serde(default)]
     pub reasoning_cost: Decimal,
+    /// Threshold of the highest price tier the request reached (`None` = base
+    /// rates or a flat price; see [`crate::pricing::Tiering`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_above_input_tokens: Option<u64>,
 }
 
 impl Cost {
@@ -48,6 +52,7 @@ impl Cost {
             cache_cost: Decimal::ZERO,
             cache_write_cost: Decimal::ZERO,
             reasoning_cost: Decimal::ZERO,
+            tier_above_input_tokens: None,
         }
     }
 }
@@ -105,6 +110,9 @@ pub struct EstimateBreakdown {
     pub output_rate_per_million: Decimal,
     /// Conditions under which the bound holds (and known gaps).
     pub assumptions: Vec<String>,
+    /// Price sheet the estimate was computed with ([`ModelPricing::version`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_version: Option<String>,
 }
 
 /// Estimated cost before the call completes.
@@ -382,18 +390,19 @@ pub(crate) fn cost_from_pricing(price: &ModelPricing, usage: &Usage) -> Result<C
         ));
     }
     let b = usage.breakdown().map_err(PricingGap::InconsistentUsage)?;
-    let charge = |class: TokenClass, tokens: u64| -> Result<Decimal, PricingGap> {
-        if tokens == 0 {
-            return Ok(Decimal::ZERO);
-        }
-        let (rate, _) = price.rate(class).ok_or(PricingGap::MissingRate(class))?;
-        Ok(per_million(rate, tokens))
+    // The tier the whole prompt reaches (prompt_tokens includes cache reads and
+    // writes); output-side classes are always billed at its rates.
+    let tier = price.tier_for(usage.prompt_tokens);
+    let (input_cost, cache_cost, cache_write_cost) = match price.tier_mode() {
+        Some(TierMode::Marginal) => marginal_input_cost(price, &b)?,
+        Some(TierMode::WholeRequest) | None => (
+            charge(&tier, TokenClass::Input, b.input)?,
+            charge(&tier, TokenClass::CachedInput, b.cached_input)?,
+            charge(&tier, TokenClass::CacheCreation, b.cache_creation)?,
+        ),
     };
-    let input_cost = charge(TokenClass::Input, b.input)?;
-    let cache_cost = charge(TokenClass::CachedInput, b.cached_input)?;
-    let cache_write_cost = charge(TokenClass::CacheCreation, b.cache_creation)?;
-    let output_cost = charge(TokenClass::Output, b.output)?;
-    let reasoning_cost = charge(TokenClass::Reasoning, b.reasoning)?;
+    let output_cost = charge(&tier, TokenClass::Output, b.output)?;
+    let reasoning_cost = charge(&tier, TokenClass::Reasoning, b.reasoning)?;
     Ok(Cost {
         currency: Currency::usd(),
         amount: input_cost + cache_cost + cache_write_cost + output_cost + reasoning_cost,
@@ -402,18 +411,72 @@ pub(crate) fn cost_from_pricing(price: &ModelPricing, usage: &Usage) -> Result<C
         cache_cost,
         cache_write_cost,
         reasoning_cost,
+        tier_above_input_tokens: tier.tier.map(|_| tier.above_input_tokens),
     })
 }
 
-fn estimate_from_pricing(
+/// `tokens` of `class` at `rates`; a used class without a rate is unknown.
+fn charge(rates: &TierRates, class: TokenClass, tokens: u64) -> Result<Decimal, PricingGap> {
+    if tokens == 0 {
+        return Ok(Decimal::ZERO);
+    }
+    let (rate, _) = rates.rate(class).ok_or(PricingGap::MissingRate(class))?;
+    Ok(per_million(rate, tokens))
+}
+
+/// [`TierMode::Marginal`] input cost: prompt positions `1..=T1` at the base
+/// rates, `T1+1..=T2` at tier 0, … — cache reads first, then cache writes, then
+/// uncached input. Returns (input, cache read, cache write) cost.
+fn marginal_input_cost(
+    price: &ModelPricing,
+    b: &crate::usage::TokenBreakdown,
+) -> Result<(Decimal, Decimal, Decimal), PricingGap> {
+    let tiers = price.all_tiers();
+    let mut placed = 0u64;
+    let mut band_cost = |class: TokenClass, mut tokens: u64| -> Result<Decimal, PricingGap> {
+        let mut total = Decimal::ZERO;
+        while tokens > 0 {
+            // The next token sits at position `placed + 1`; a tier covers the
+            // positions strictly above its threshold.
+            let i = tiers
+                .iter()
+                .rposition(|t| t.tier.is_none() || placed >= t.above_input_tokens)
+                .unwrap_or(0);
+            let band_end = tiers
+                .get(i + 1)
+                .map_or(u64::MAX, |next| next.above_input_tokens);
+            let n = tokens.min(band_end - placed);
+            total += charge(&tiers[i], class, n)?;
+            placed += n;
+            tokens -= n;
+        }
+        Ok(total)
+    };
+    let cache = band_cost(TokenClass::CachedInput, b.cached_input)?;
+    let cache_write = band_cost(TokenClass::CacheCreation, b.cache_creation)?;
+    let input = band_cost(TokenClass::Input, b.input)?;
+    Ok((input, cache, cache_write))
+}
+
+/// Upper bound for `price`: the input bound at the highest input-side rate and the
+/// output bound at the highest output-side rate of every tier the input bound
+/// can reach. This dominates both tier modes: a request can only be billed at
+/// the rates of tiers its prompt reaches, and never above the highest of them.
+pub(crate) fn estimate_from_pricing(
     price: &ModelPricing,
     input: InputBound,
     output: Option<(u64, OutputBoundSource)>,
 ) -> Option<CostEstimate> {
+    let input_tokens = input.total();
+    let reachable: Vec<TierRates> = price
+        .all_tiers()
+        .into_iter()
+        .filter(|t| t.tier.is_none() || input_tokens > t.above_input_tokens)
+        .collect();
     let max_rate = |classes: &[TokenClass]| -> Option<Decimal> {
-        classes
+        reachable
             .iter()
-            .filter_map(|c| price.rate(*c).map(|(r, _)| r))
+            .flat_map(|t| classes.iter().filter_map(|c| t.rate(*c).map(|(r, _)| r)))
             .max()
     };
     // The plain input / output rates must exist; other classes only raise the bound.
@@ -430,7 +493,6 @@ fn estimate_from_pricing(
         }
         None => Decimal::ZERO,
     };
-    let input_tokens = input.total();
     let (output_tokens, source) = output.unwrap_or((0, OutputBoundSource::None));
     let input_cost = per_million(input_rate, input_tokens);
     let output_cost = per_million(output_rate, output_tokens);
@@ -448,6 +510,22 @@ fn estimate_from_pricing(
     }
     if source == OutputBoundSource::None {
         assumptions.push("no output bound: this is not a worst case".to_string());
+    }
+    if let Some(tiering) = &price.tiering {
+        let mode = price.tier_mode().unwrap_or(TierMode::WholeRequest);
+        match reachable.last().filter(|t| t.tier.is_some()) {
+            Some(top) => assumptions.push(format!(
+                "tiered price ({mode:?}): input bound {input_tokens} exceeds {}; the \
+                 highest rates of the base and {} reachable tier(s) apply",
+                top.above_input_tokens,
+                reachable.len() - 1
+            )),
+            None => assumptions.push(format!(
+                "tiered price ({mode:?}): input bound {input_tokens} <= first tier \
+                 threshold {}; base rates apply",
+                tiering.tiers.first().map_or(0, |t| t.above_input_tokens)
+            )),
+        }
     }
     let tool_tokens = input
         .tool_schema_bytes
@@ -474,6 +552,7 @@ fn estimate_from_pricing(
             input_rate_per_million: input_rate,
             output_rate_per_million: output_rate,
             assumptions,
+            pricing_version: Some(price.version()),
         },
     })
 }
@@ -616,6 +695,120 @@ mod tests {
             ..usage(1_000_000, 1_000_000)
         };
         assert!(cost_from_pricing(&p, &worst_usage).unwrap().amount <= e.total);
+    }
+
+    /// Base 1 / 10 (cached 0.5), above 100 input tokens 2 / 20 (cached 1),
+    /// above 1000 input tokens 4 / 40 (cached 2) — USD per 1M.
+    fn tiered(mode: TierMode) -> ModelPricing {
+        use crate::pricing::{PriceTier, Tiering};
+        let tier = |above: u64, input: i64, output: i64, cached: i64| PriceTier {
+            above_input_tokens: above,
+            input_per_million: Decimal::from(input),
+            output_per_million: Decimal::from(output),
+            cached_input_per_million: Some(Decimal::from(cached)),
+            cache_write_per_million: None,
+            reasoning_per_million: None,
+        };
+        let mut p = price(1, 10);
+        p.cached_input_per_million = Some(Decimal::new(5, 1));
+        p.tiering = Some(Tiering {
+            mode,
+            tiers: vec![tier(100, 2, 20, 1), tier(1_000, 4, 40, 2)],
+        });
+        p
+    }
+
+    /// `n` USD per 1M tokens × `tokens`.
+    fn usd(n: i64, tokens: u64) -> Decimal {
+        per_million(Decimal::from(n), tokens)
+    }
+
+    #[test]
+    fn whole_request_bills_every_class_at_the_reached_tier() {
+        let p = tiered(TierMode::WholeRequest);
+        // Below and exactly at the threshold: base rates.
+        for prompt in [99, 100] {
+            let c = cost_from_pricing(&p, &usage(prompt, 7)).unwrap();
+            assert_eq!(c.input_cost, usd(1, prompt));
+            assert_eq!(c.output_cost, usd(10, 7));
+            assert_eq!(c.tier_above_input_tokens, None);
+        }
+        // One token above: the whole request moves, output and cache included.
+        let u = Usage {
+            cached_tokens: Some(60),
+            ..usage(101, 7)
+        };
+        let c = cost_from_pricing(&p, &u).unwrap();
+        assert_eq!(c.cache_cost, usd(1, 60));
+        assert_eq!(c.input_cost, usd(2, 41));
+        assert_eq!(c.output_cost, usd(20, 7));
+        assert_eq!(c.tier_above_input_tokens, Some(100));
+        let c = cost_from_pricing(&p, &usage(1_001, 1)).unwrap();
+        assert_eq!(c.amount, usd(4, 1_001) + usd(40, 1));
+        assert_eq!(c.tier_above_input_tokens, Some(1_000));
+    }
+
+    #[test]
+    fn marginal_bills_each_band_at_its_own_rate() {
+        let p = tiered(TierMode::Marginal);
+        // At the threshold nothing is in the upper band.
+        let c = cost_from_pricing(&p, &usage(100, 7)).unwrap();
+        assert_eq!(c.amount, usd(1, 100) + usd(10, 7));
+        // 150 input: 100 at the base rate, 50 above; output at the reached tier.
+        let c = cost_from_pricing(&p, &usage(150, 7)).unwrap();
+        assert_eq!(c.input_cost, usd(1, 100) + usd(2, 50));
+        assert_eq!(c.output_cost, usd(20, 7));
+        assert_eq!(c.tier_above_input_tokens, Some(100));
+        // Cache reads fill the prompt first: 120 cached = 100 base + 20 tier 0,
+        // then 30 uncached in tier 0.
+        let u = Usage {
+            cached_tokens: Some(120),
+            ..usage(150, 0)
+        };
+        let c = cost_from_pricing(&p, &u).unwrap();
+        assert_eq!(c.cache_cost, usd_frac(5, 1, 100) + usd(1, 20));
+        assert_eq!(c.input_cost, usd(2, 30));
+        // Three bands.
+        let c = cost_from_pricing(&p, &usage(1_500, 0)).unwrap();
+        assert_eq!(c.input_cost, usd(1, 100) + usd(2, 900) + usd(4, 500));
+        assert_eq!(c.tier_above_input_tokens, Some(1_000));
+    }
+
+    /// `mantissa`e-`scale` USD per 1M × `tokens`.
+    fn usd_frac(mantissa: i64, scale: u32, tokens: u64) -> Decimal {
+        per_million(Decimal::new(mantissa, scale), tokens)
+    }
+
+    #[test]
+    fn tiered_estimate_uses_every_reachable_tier() {
+        for mode in [TierMode::WholeRequest, TierMode::Marginal] {
+            let p = tiered(mode);
+            let out = Some((10, OutputBoundSource::RequestMaxTokens));
+            // An input bound at the threshold cannot reach the tier.
+            let e = estimate_from_pricing(&p, InputBound::tokens(100), out).unwrap();
+            assert_eq!(e.breakdown.input_rate_per_million, Decimal::ONE);
+            assert_eq!(e.breakdown.output_rate_per_million, Decimal::TEN);
+            assert!(e.explain().contains("base rates apply"), "{}", e.explain());
+            // One more token can: the expensive tier is reserved.
+            let e = estimate_from_pricing(&p, InputBound::tokens(101), out).unwrap();
+            assert_eq!(e.breakdown.input_rate_per_million, Decimal::TWO);
+            assert_eq!(e.breakdown.output_rate_per_million, Decimal::from(20));
+            assert_eq!(e.total, usd(2, 101) + usd(20, 10));
+            assert!(e.explain().contains("exceeds 100"), "{}", e.explain());
+            assert_eq!(e.breakdown.pricing_version, Some(p.version()));
+            let e = estimate_from_pricing(&p, InputBound::tokens(5_000), out).unwrap();
+            assert_eq!(e.breakdown.input_rate_per_million, Decimal::from(4));
+        }
+        // A cheaper upper tier never lowers the bound below a reachable rate.
+        let mut p = tiered(TierMode::WholeRequest);
+        p.tiering.as_mut().unwrap().tiers[1].output_per_million = Decimal::ONE;
+        let e = estimate_from_pricing(
+            &p,
+            InputBound::tokens(5_000),
+            Some((10, OutputBoundSource::RequestMaxTokens)),
+        )
+        .unwrap();
+        assert_eq!(e.breakdown.output_rate_per_million, Decimal::from(20));
     }
 
     #[test]

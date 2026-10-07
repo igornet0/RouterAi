@@ -82,6 +82,7 @@ async fn runtime(tools_before_final: usize) -> (MockServer, RouterRuntime) {
         cache_write_per_million: None,
         reasoning_per_million: None,
         effective_from: chrono::Utc::now(),
+        tiering: None,
     });
     let rt = RouterRuntime::builder()
         .ai(Arc::new(ai))

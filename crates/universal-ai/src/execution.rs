@@ -29,9 +29,11 @@ use tracing::Instrument;
 
 use crate::account::ApiKeyManager;
 use crate::budget::SpendLedger;
-use crate::cost::CostManager;
-use crate::error::AiError;
+use crate::cost::{cost_from_pricing, CostManager, PricingGap};
+use crate::error::{AiError, AiResult};
 use crate::events::{AiEvent, EventBus, RequestCompleted};
+use crate::pricing::ModelPricing;
+use crate::storage::Storage;
 use crate::telemetry::{AttemptReport, TelemetrySink};
 use crate::types::{ChatResponse, ChatStream, ModelId, ProviderId, StreamEvent};
 use crate::usage::{CostStatus, RequestUsage, Usage, UsageManager};
@@ -49,6 +51,42 @@ pub(crate) struct Core {
     /// Models whose worst case was falsified by a bill above the reserved token
     /// bounds (see [`AiError::WorstCaseUnbounded`]).
     pub unbounded: Mutex<HashSet<(ProviderId, ModelId)>>,
+    /// Persists the price sheets attempts are priced with.
+    pub pricing_journal: PricingJournal,
+}
+
+/// Saves each price sheet to storage before the first row that references its
+/// version, once per process.
+pub(crate) struct PricingJournal {
+    storage: Arc<dyn Storage>,
+    saved: Mutex<HashSet<String>>,
+}
+
+impl PricingJournal {
+    pub(crate) fn new(storage: Arc<dyn Storage>) -> Self {
+        Self {
+            storage,
+            saved: Mutex::default(),
+        }
+    }
+
+    /// Persist `pricing` (unless this process already did) and return its version.
+    pub(crate) async fn ensure(&self, pricing: &ModelPricing) -> AiResult<String> {
+        let version = pricing.version();
+        let known = self
+            .saved
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&version);
+        if !known {
+            self.storage.save_pricing_version(pricing).await?;
+            self.saved
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(version.clone());
+        }
+        Ok(version)
+    }
 }
 
 impl Core {
@@ -121,6 +159,22 @@ impl Core {
     /// attribute it to its key, and report it. Never fails: if persisting fails the
     /// reservation stays charged (in memory and in the persisted `Pending` row).
     async fn finish_now(&self, reserved: Decimal, row: RequestUsage, ttft: Option<Duration>) {
+        // The sheet a settled row references is stored before the row.
+        if let Some(pricing) = row
+            .accounting
+            .pricing_version
+            .as_deref()
+            .and_then(|v| self.cost.pricing().get_version(v))
+        {
+            if let Err(err) = self.pricing_journal.ensure(&pricing).await {
+                tracing::error!(
+                    request_id = %row.request_id,
+                    pricing_version = ?row.accounting.pricing_version,
+                    error = %err,
+                    "failed to persist the price sheet of an attempt"
+                );
+            }
+        }
         if let Err(err) = self.ledger.settle(reserved, &row).await {
             tracing::error!(
                 request_id = %row.request_id,
@@ -223,6 +277,9 @@ struct MeterState {
     row: RequestUsage,
     /// Model id of the request (the provider may answer with a dated variant).
     requested_model: ModelId,
+    /// Price sheet of the requested model the estimate / reservation used; the
+    /// attempt settles with it even if the registry changes mid-flight.
+    pricing: Option<ModelPricing>,
     reserved: Decimal,
     controlled: bool,
     started: Instant,
@@ -251,11 +308,13 @@ impl AttemptMeter {
         controlled: bool,
         started: Instant,
         (input_bound, output_bound): (u64, Option<u64>),
+        pricing: Option<ModelPricing>,
     ) -> Self {
         Self {
             core,
             state: Some(MeterState {
                 requested_model: row.model.clone(),
+                pricing,
                 row,
                 reserved,
                 controlled,
@@ -529,8 +588,11 @@ fn mark_unknown(row: &mut RequestUsage, status: CostStatus, charge: Option<Decim
     row.accounting.cost_note = Some(note.to_string());
 }
 
-/// Price `usage` (the provider-reported model first, then the requested one) and
-/// record the result; `known_status` is used when the cost is known.
+/// Price `usage` and record the result; `known_status` is used when the cost is
+/// known. Price sheets, in order: the provider-reported model's current sheet
+/// (when it answered with another model id, e.g. a dated variant), then the
+/// requested model's sheet pinned at reservation (its current sheet when none
+/// was pinned). The sheet that priced the usage is recorded on the row.
 fn price_into(
     s: &mut MeterState,
     cost: &CostManager,
@@ -540,29 +602,38 @@ fn price_into(
     unknown_charge: Option<Decimal>,
 ) {
     s.row.usage = usage.clone();
-    let priced = cost.price(&s.row.provider, model, usage).or_else(|first| {
-        if model == &s.requested_model {
-            Err(first)
-        } else {
-            cost.price(&s.row.provider, &s.requested_model, usage)
-        }
-    });
-    match priced {
-        Ok(c) => {
-            s.row.accounting.status = known_status;
-            s.row.accounting.charged_cost = Some(c.amount);
-            s.row.accounting.cost_note = None;
-            s.row.cost = Some(c);
-        }
-        Err(gap) => {
-            let status = if known_status == CostStatus::Abandoned {
-                CostStatus::Abandoned
-            } else {
-                CostStatus::PricingUnavailable
-            };
-            mark_unknown(&mut s.row, status, unknown_charge, &gap.to_string());
+    let registry = cost.pricing();
+    let mut sheets = Vec::with_capacity(2);
+    if model != &s.requested_model {
+        sheets.extend(registry.get_price_sync(&s.row.provider, model));
+    }
+    match &s.pricing {
+        Some(p) => sheets.push(p.clone()),
+        None => sheets.extend(registry.get_price_sync(&s.row.provider, &s.requested_model)),
+    }
+    let mut gap = None;
+    for sheet in &sheets {
+        match cost_from_pricing(sheet, usage) {
+            Ok(c) => {
+                s.row.accounting.status = known_status;
+                s.row.accounting.charged_cost = Some(c.amount);
+                s.row.accounting.cost_note = None;
+                s.row.accounting.pricing_version = Some(sheet.version());
+                s.row.cost = Some(c);
+                return;
+            }
+            Err(g) => {
+                gap.get_or_insert(g);
+            }
         }
     }
+    let gap = gap.unwrap_or(PricingGap::NoPrice);
+    let status = if known_status == CostStatus::Abandoned {
+        CostStatus::Abandoned
+    } else {
+        CostStatus::PricingUnavailable
+    };
+    mark_unknown(&mut s.row, status, unknown_charge, &gap.to_string());
 }
 
 /// Forward a provider stream while metering it. Pull-based: no task is spawned,
@@ -639,6 +710,7 @@ mod tests {
     fn state(controlled: bool, dispatched: bool) -> MeterState {
         MeterState {
             requested_model: ModelId::new("m"),
+            pricing: None,
             row: RequestUsage {
                 request_id: RequestId::new(),
                 provider: ProviderId::openai(),

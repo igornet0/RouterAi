@@ -7,8 +7,8 @@ only then is the public API frozen and a release candidate cut.
 ```
 FOUNDATION                          INTEGRATION
   P2.5 Accounting        ✅
-  P2.2 CI + MSRV         🔄
-  P2.3 Tiered pricing
+  P2.2 CI + MSRV         ✅
+  P2.3 Tiered pricing    🔄
   Provider policy
   Minimal trace + concurrency cap
   Provider matrix  ───────────────▶  Integration Lab (apps A–D)
@@ -39,7 +39,7 @@ Every gate below is checked against these:
 
 ## Backlog (in order)
 
-### 1. P2.2 — CI + MSRV
+### 1. P2.2 — CI + MSRV ✅
 Push through a PR, fix only real CI failures. Do not keep expanding CI.
 **Done when** CI (fmt, clippy, tests on Linux/macOS, MSRV 1.88, web build) is green.
 
@@ -51,14 +51,19 @@ Push through a PR, fix only real CI failures. Do not keep expanding CI.
   application mode.
 - Reservation is worst case: if a request may cross into a more expensive
   tier, the reservation uses the expensive tier.
-- A request without `max_tokens` has no output upper bound → explicit rule
-  (default cap or refusal), otherwise it is a budget bypass.
+- A request without `max_tokens` has no output upper bound → explicit rule.
+  Already in place before P2.3: a budget-controlled request without
+  `max_tokens` gets the model's registered `max_output_tokens` pinned as
+  `max_tokens`, or is refused (`OutputLimitUnknown`).
 - History: price sheets are immutable versions in their own table; each cost
   record stores `pricing_version` (id/hash), not a copy of the sheet, so
   SQLite growth stays bounded and price changes never rewrite history.
 - SQLite migration: old records readable, new records written, restart safe.
 - Tests: below / exact / above threshold, both modes, input / output / cached
   input, reserve / settle / refund, restart, reconciliation.
+- Also: the estimate, reservation and settlement of an attempt use one sheet,
+  even if the registry changes mid-flight; reconciliation reprices with the
+  attempt's own sheet. Design: `crates/universal-ai/docs/PRICING.md`.
 
 ### 3. Provider policy
 Extend the existing `Router` (alongside `KeySelectionStrategy`, `MaxCost`) —

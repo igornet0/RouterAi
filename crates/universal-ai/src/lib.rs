@@ -133,8 +133,8 @@ pub use events::{AiEvent, EventBus};
 pub use health::{HealthMonitor, HealthStatus};
 pub use models::{ModelInfo, ModelRegistry};
 pub use pricing::{
-    CustomPricing, ModelPricing, PricingProvider, PricingRegistry, RateSource, RemotePricing,
-    StaticPricing, TokenClass,
+    CustomPricing, ModelPricing, PriceTier, PricingProvider, PricingRegistry, RateSource,
+    RemotePricing, StaticPricing, TierMode, TierRates, Tiering, TokenClass,
 };
 pub use provider::{Provider, ProviderCredential};
 pub use provider_catalog::{

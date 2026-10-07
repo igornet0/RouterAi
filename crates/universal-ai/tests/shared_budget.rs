@@ -302,7 +302,10 @@ async fn schema_v2_database_gets_totals_rebuilt_from_its_rows() {
     pool.close().await;
 
     let storage = SqliteStorage::connect(&db_url(&db)).await.unwrap();
-    assert_eq!(storage.schema_version().await.unwrap(), 3);
+    assert_eq!(
+        storage.schema_version().await.unwrap(),
+        universal_ai::storage::SQLITE_SCHEMA_VERSION
+    );
     assert_eq!(committed_today(&db).await, d(ACTUAL) + d(WORST));
     assert_eq!(committed_today(&db).await, rows_charge(&db, None).await);
     let _ = std::fs::remove_file(db);

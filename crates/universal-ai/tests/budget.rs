@@ -64,6 +64,7 @@ fn price(provider: ProviderId, model: &str) -> ModelPricing {
         cache_write_per_million: None,
         reasoning_per_million: None,
         effective_from: Utc::now(),
+        tiering: None,
     }
 }
 

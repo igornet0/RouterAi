@@ -8,6 +8,7 @@ use std::sync::RwLock;
 use crate::account::Account;
 use crate::balance::Balance;
 use crate::error::{AiError, AiResult};
+use crate::pricing::ModelPricing;
 use crate::types::RequestId;
 use crate::usage::{validate_importance, CostStatus, RequestUsage};
 
@@ -85,6 +86,21 @@ pub trait Storage: Send + Sync {
         Ok(rows)
     }
 
+    /// Keep the price sheet `pricing` under its [`ModelPricing::version`]. Called
+    /// before the first row referencing the version is written; saving the same
+    /// version again changes nothing. The default keeps nothing — persistent
+    /// backends should override it (and [`Storage::get_pricing_version`]).
+    async fn save_pricing_version(&self, pricing: &ModelPricing) -> AiResult<()> {
+        let _ = pricing;
+        Ok(())
+    }
+
+    /// A price sheet saved with [`Storage::save_pricing_version`].
+    async fn get_pricing_version(&self, version: &str) -> AiResult<Option<ModelPricing>> {
+        let _ = version;
+        Ok(None)
+    }
+
     /// Whether [`Storage::reserve`] decides atomically for every process sharing
     /// this storage. When `false` (the default) the client's in-process ledger
     /// decides — correct only while a single client uses the storage.
@@ -126,6 +142,7 @@ pub struct MemoryStorage {
     requests: RwLock<Vec<RequestUsage>>,
     balances: RwLock<Vec<Balance>>,
     accounts: RwLock<Vec<Account>>,
+    pricing_versions: RwLock<std::collections::HashMap<String, ModelPricing>>,
 }
 
 impl MemoryStorage {
@@ -147,6 +164,28 @@ impl Storage for MemoryStorage {
             g.push(row.clone());
         }
         Ok(())
+    }
+
+    async fn save_pricing_version(&self, pricing: &ModelPricing) -> AiResult<()> {
+        self.pricing_versions
+            .write()
+            .map_err(|_| AiError::Storage {
+                message: "lock poisoned".into(),
+            })?
+            .entry(pricing.version())
+            .or_insert_with(|| pricing.clone());
+        Ok(())
+    }
+
+    async fn get_pricing_version(&self, version: &str) -> AiResult<Option<ModelPricing>> {
+        Ok(self
+            .pricing_versions
+            .read()
+            .map_err(|_| AiError::Storage {
+                message: "lock poisoned".into(),
+            })?
+            .get(version)
+            .cloned())
     }
 
     async fn get_request(&self, id: &RequestId) -> AiResult<Option<RequestUsage>> {

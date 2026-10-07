@@ -88,8 +88,9 @@ canonical `Usage` and `StreamEvent`s.
   adjusted by reconciliation.
 * Cross-process budgets need `SqliteStorage` (atomic reservations); with
   `MemoryStorage` or a custom storage the budget is per `AiClient`.
-* One rate per token class: tiered (long-context) prices are not modelled — see
-  [PRICING](PRICING.md#tiered-long-context-prices).
+* Tiered prices are keyed on input tokens only (see
+  [PRICING](PRICING.md#tiered-long-context-prices)); `Marginal` is RouterAi's
+  definition and must be checked against the provider's billing.
 * A provider that bills beyond the reserved token bounds is charged its actual
   cost; the model is then refused for budget-controlled requests
   (`WorstCaseUnbounded`), but attempts already in flight can overrun as well.

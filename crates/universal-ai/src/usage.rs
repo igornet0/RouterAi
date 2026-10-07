@@ -291,6 +291,13 @@ pub struct CostAccounting {
     /// Classification of the error that ended the attempt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_kind: Option<ErrorKind>,
+    /// Price sheet the attempt was estimated and priced with
+    /// ([`crate::pricing::ModelPricing::version`]); the sheet itself is kept by the
+    /// storage ([`crate::storage::Storage::get_pricing_version`]), so a later price
+    /// change never reprices this attempt. `None` for rows from before P2.3 and for
+    /// attempts on a model without a price.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing_version: Option<String>,
 }
 
 fn default_json_object() -> serde_json::Value {
