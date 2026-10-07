@@ -20,6 +20,7 @@ UsageReceived`, ending in exactly one settlement whose persisted outcome is a
 | usage in the final chunk (OpenAI `include_usage`, Anthropic `message_delta`) | `Actual` |
 | usage never arrives | `UsageUnavailable`, reservation charged |
 | usage arrives as `null` | ignored (not zero) |
+| OpenAI-compatible: usage on a chunk whose choice has not finished (running count) | not forwarded — only usage on a chunk without choices or at / after `finish_reason` is final |
 | usage reported more than once | field-wise maximum (never summed, never lowered) |
 | malformed chunk | stream ends with `AiError::Serialization`; reservation charged unless final usage arrived |
 | provider error event (Anthropic `error`, in-band `{"error":…}`) | stream ends with `AiError::Provider` |

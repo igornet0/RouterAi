@@ -6,7 +6,7 @@ All fallible APIs return `AiResult<T> = Result<T, AiError>`. `AiError` is
 | `ErrorKind` | Variants | Typical cause |
 |---|---|---|
 | `Budget` | `BudgetExceeded`, `DailyLimitExceeded`, `MonthlyLimitExceeded` | local spend limit |
-| `Pricing` | `PricingUnavailable`, `OutputLimitUnknown` | cost cannot be bounded |
+| `Pricing` | `PricingUnavailable`, `OutputLimitUnknown`, `WorstCaseUnbounded` | cost cannot be bounded (no price, no output bound, or the provider already billed beyond the bound) |
 | `Usage` | `UsageUnavailable` | no usage under `MissingUsagePolicy::Reject` |
 | `RateLimit` | `RateLimit` | provider 429 (`retry_after_secs()`) |
 | `ProviderQuota` | `InsufficientBalance` | provider 402 / exhausted balance |

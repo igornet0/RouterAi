@@ -666,9 +666,14 @@ impl RouterRuntime {
 
             // Correlates every physical attempt (retries / fallbacks) of this turn.
             let request_id = universal_ai::RequestId::new();
+            // Fail closed on cost even without a run / daily budget: a model without
+            // a known price (or without an output bound) is refused before any HTTP,
+            // and an attempt whose cost cannot be determined is charged its
+            // reservation — a run's cost is never a silent $0.
             let mut builder = ai
                 .chat()
                 .request_id(request_id)
+                .require_cost_bound()
                 .provider(agent.model.provider.clone())
                 .model(agent.model.model.clone())
                 .messages(messages.iter().cloned())
@@ -695,7 +700,7 @@ impl RouterRuntime {
                 Err(err) => {
                     // Failed attempts may still have been charged (timeouts, broken
                     // responses, cancellation): count them toward the run.
-                    let charged = logical_charge(&ai, &request_id);
+                    let charged = logical_charge(&ai, &request_id).await;
                     if !charged.is_zero() {
                         run.add_model_usage(RunUsage::default(), RunCost { amount: charged });
                     }
@@ -735,7 +740,7 @@ impl RouterRuntime {
             // worst-case reservation (budget-controlled) — never a silent zero.
             // Summed over every attempt of the turn (retries / fallbacks included).
             let accounting = ai.request_usage(&response.request_id);
-            let charged = logical_charge(&ai, &request_id);
+            let charged = logical_charge(&ai, &request_id).await;
             run.add_model_usage(
                 response.usage().map(RunUsage::from).unwrap_or_default(),
                 RunCost { amount: charged },
@@ -1203,9 +1208,22 @@ pub fn published_agent(name: &str, instructions: &str) -> Agent {
     a
 }
 
-/// What one logical model request (all its physical attempts) was charged.
-fn logical_charge(ai: &universal_ai::AiClient, request_id: &universal_ai::RequestId) -> Decimal {
-    ai.logical_request_attempts(request_id)
+/// What one logical model request (all its physical attempts) was charged, as
+/// persisted (independent of the client's bounded in-memory rows). Falls back to
+/// the in-memory rows only if storage cannot answer.
+async fn logical_charge(
+    ai: &universal_ai::AiClient,
+    request_id: &universal_ai::RequestId,
+) -> Decimal {
+    let attempts = match ai.load_logical_request_attempts(request_id).await {
+        Ok(rows) if !rows.is_empty() => rows,
+        Ok(_) => ai.logical_request_attempts(request_id),
+        Err(err) => {
+            tracing::warn!(error = %err, "run cost from in-memory attempts (storage unavailable)");
+            ai.logical_request_attempts(request_id)
+        }
+    };
+    attempts
         .iter()
         .map(universal_ai::RequestUsage::budget_charge)
         .sum()

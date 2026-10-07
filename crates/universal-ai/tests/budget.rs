@@ -708,3 +708,41 @@ async fn n_cost_is_attributed_to_the_key_that_was_used() {
     let persisted = serde_json::to_string(&client.list_ai_requests(10).await.unwrap()).unwrap();
     assert!(!persisted.contains("KEY_A_TEST") && !persisted.contains("KEY_B_TEST"));
 }
+
+/// `require_cost_bound` turns a request without any limit into a budget-controlled
+/// one: unknown pricing is refused before HTTP and a response without usage is
+/// charged its reservation instead of nothing.
+#[tokio::test]
+async fn require_cost_bound_refuses_unpriced_and_never_charges_nothing() {
+    let server = mock(|_| reply(None, "ok")).await;
+    let c = client_no_budget(&server); // "m" is priced, "unpriced" is not
+
+    let err = c
+        .chat()
+        .model("unpriced")
+        .message("hi")
+        .max_tokens(100)
+        .require_cost_bound()
+        .send()
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AiError::PricingUnavailable { .. }), "{err:?}");
+    assert_eq!(hits(&server).await, 0, "refused before HTTP");
+
+    c.chat()
+        .model("m")
+        .message("hi")
+        .max_tokens(100)
+        .require_cost_bound()
+        .send()
+        .await
+        .unwrap();
+    let row = &c.list_ai_requests(1).await.unwrap()[0];
+    assert_eq!(row.accounting.status, CostStatus::UsageUnavailable);
+    assert_eq!(row.accounting.reserved_cost, Some(d(WORST)));
+    assert_eq!(
+        row.accounting.charged_cost,
+        Some(d(WORST)),
+        "no usage: the reservation is charged, not zero"
+    );
+}

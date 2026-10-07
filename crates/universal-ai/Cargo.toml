@@ -21,6 +21,7 @@ chrono = { workspace = true }
 eventsource-stream = { workspace = true }
 futures = { workspace = true }
 reqwest = { workspace = true }
+ring = "0.17"
 rust_decimal = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }

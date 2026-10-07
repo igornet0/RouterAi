@@ -186,7 +186,10 @@ fn eval_condition(cond: &Condition, event: &Event) -> bool {
         ConditionOp::Exists => !actual.is_null(),
         ConditionOp::Eq => cond.value.as_ref().is_some_and(|v| &actual == v),
         ConditionOp::Neq => cond.value.as_ref().is_some_and(|v| &actual != v),
-        ConditionOp::Contains => match (actual.as_str(), cond.value.as_ref().and_then(|v| v.as_str())) {
+        ConditionOp::Contains => match (
+            actual.as_str(),
+            cond.value.as_ref().and_then(|v| v.as_str()),
+        ) {
             (Some(hay), Some(needle)) => hay.contains(needle),
             _ => false,
         },

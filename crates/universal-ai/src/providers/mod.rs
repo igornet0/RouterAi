@@ -11,5 +11,5 @@ pub use anthropic::Anthropic;
 pub use deepseek::DeepSeek;
 pub use gemini::Gemini;
 pub use openai::OpenAI;
-pub use openai_compatible::{OpenAICompatible, OpenAICompatibleBuilder};
+pub use openai_compatible::{OpenAICompatible, OpenAICompatibleBuilder, OutputLimitParam};
 pub use openrouter::OpenRouter;

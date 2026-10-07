@@ -185,9 +185,7 @@ pub async fn validate_publish(
         message: if budget_ok {
             format!(
                 "max_steps={} max_runtime={}s max_run_cost={:?}",
-                agent.limits.max_steps,
-                agent.limits.max_runtime_seconds,
-                agent.budget.max_run_cost
+                agent.limits.max_steps, agent.limits.max_runtime_seconds, agent.budget.max_run_cost
             )
         } else {
             "invalid limits".into()

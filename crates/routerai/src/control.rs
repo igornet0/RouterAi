@@ -57,11 +57,7 @@ impl<'a> ControlPlane<'a> {
     }
 
     /// Publish with validation (+ optional test override → audit).
-    pub async fn publish(
-        &self,
-        id: &AgentId,
-        opts: PublishOptions,
-    ) -> RouterResult<PublishResult> {
+    pub async fn publish(&self, id: &AgentId, opts: PublishOptions) -> RouterResult<PublishResult> {
         let report = self.runtime.validate_publish(id).await?;
         let test_soft_fail = report
             .soft_failures()
@@ -138,7 +134,12 @@ impl<'a> ControlPlane<'a> {
         let next = lifecycle::transition(&agent, AgentStatus::Paused)?;
         let saved = self.runtime.upsert_agent(next).await?;
         self.audit()
-            .record("agent.pause", actor, Some(id.to_string()), serde_json::json!({}))
+            .record(
+                "agent.pause",
+                actor,
+                Some(id.to_string()),
+                serde_json::json!({}),
+            )
             .await;
         Ok(saved)
     }
@@ -149,7 +150,12 @@ impl<'a> ControlPlane<'a> {
         let next = lifecycle::transition(&agent, AgentStatus::Published)?;
         let saved = self.runtime.upsert_agent(next).await?;
         self.audit()
-            .record("agent.resume", actor, Some(id.to_string()), serde_json::json!({}))
+            .record(
+                "agent.resume",
+                actor,
+                Some(id.to_string()),
+                serde_json::json!({}),
+            )
             .await;
         Ok(saved)
     }

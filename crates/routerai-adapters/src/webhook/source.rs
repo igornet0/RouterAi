@@ -44,11 +44,7 @@ pub fn normalize_event_type(raw: &str) -> String {
 }
 
 /// Build a platform [`Event`] from webhook HTTP body.
-pub fn ingress_event(
-    event_type: &str,
-    payload: Value,
-    opts: WebhookIngressOptions,
-) -> Event {
+pub fn ingress_event(event_type: &str, payload: Value, opts: WebhookIngressOptions) -> Event {
     let mut event = Event::new(normalize_event_type(event_type), "webhook", payload);
     if let Some(account) = opts.account {
         event = event.with_account(account);

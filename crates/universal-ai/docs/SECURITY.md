@@ -10,13 +10,24 @@
 | tracing | only ids, sizes, money; no headers, no content | `secrets_regression.rs` (captures TRACE output) |
 | telemetry | `AttemptReport` (ids, numbers) | `secrets_regression.rs` |
 | URLs | Gemini sends its key in `x-goog-api-key`, not the query string | — |
+| files at rest | `EncryptedFileSecretStore` (see below) | `encrypted_secret_store.rs` |
 
 Managed keys live only in the `SecretStore`; each attempt binds the selected key
 to a fresh adapter instance that is dropped afterwards
 ([ACCOUNT_MANAGEMENT](../../../docs/ACCOUNT_MANAGEMENT.md)).
 
-Not covered here (out of scope of this library stage): `FileSecretStore` uses
-XOR obfuscation, not encryption; `KeychainSecretStore` falls back to memory.
+## Secret stores
+
+| Store | At rest |
+|---|---|
+| `EncryptedFileSecretStore` | AES-256-GCM over the whole map (fresh random nonce per write, versioned header as AAD); file `0600`, replaced atomically; wider permissions are tightened on open. Wrong key, tampering or unknown format → `AiError::SecretStore`, never an empty store. `SecretStoreKey` comes from 64 hex chars or a `0600` key file (`load_or_create`) — keep it outside the data directory. |
+| `FileSecretStore` (deprecated) | XOR obfuscation — **not** encryption. Migrate with `EncryptedFileSecretStore::import_legacy_file` (imports, persists, deletes the old file). |
+| `KeychainSecretStore` | falls back to memory (no OS keychain integration yet). |
+| `MemorySecretStore` | process memory only. |
+
+Proven by `tests/encrypted_secret_store.rs` (no plaintext or single-byte-XOR copy
+of the secret on disk, `0600` files, wrong key / flipped bit / garbage rejected,
+legacy import, concurrent writes).
 
 ## Content
 

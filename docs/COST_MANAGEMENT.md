@@ -85,4 +85,4 @@ Streams pass the same gate. OpenAI-compatible requests send
 dropped (dropping closes the connection); without final usage the reservation
 stays charged.
 
-CLI example prices are loaded only when the CLI opts in via `.with_example_prices()` — never treat them as live tariffs.
+CLI example prices are loaded only when the CLI opts in via `.with_example_prices()` — never treat them as live tariffs. `routerai-server` never loads them: its prices come from the operator's price sheet (`pricing.toml`, see the README), and the agent runtime marks every model request `require_cost_bound()`, so an unpriced model is refused before sending instead of costing a silent `$0`.

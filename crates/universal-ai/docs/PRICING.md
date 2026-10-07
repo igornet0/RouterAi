@@ -74,6 +74,14 @@ The estimate is a worst case only under its listed assumptions. Property test
 `pricing_properties.rs` checks `cost ≤ estimate` for every usage within the
 bounds and every combination of priced classes.
 
+## Tiered (long-context) prices
+
+`ModelPricing` has one rate per token class. Models whose price depends on the
+prompt size (e.g. a higher rate above 200k input tokens) cannot be expressed:
+both the worst case and the "actual" cost use the registered rate. Register the
+**highest** tier's rates for such models if prompts can cross the threshold —
+otherwise `Actual` understates the provider's bill.
+
 ## Multimodal input
 
 Image / audio / file content parts are rejected before dispatch: no adapter

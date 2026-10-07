@@ -284,7 +284,7 @@ impl AgentStore {
             .into_iter()
             .filter(|a| &a.lineage_id == lineage_id)
             .collect();
-        v.sort_by(|a, b| a.version.cmp(&b.version));
+        v.sort_by_key(|a| a.version);
         v
     }
 

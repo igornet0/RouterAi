@@ -109,6 +109,21 @@ pub enum AiError {
         model: ModelId,
     },
 
+    /// An earlier attempt on this model was billed more tokens than its worst case
+    /// allowed (input above the byte bound or output above `max_tokens`), so the
+    /// worst case of this model cannot be trusted: budget-controlled requests to it
+    /// are refused for the rest of the process.
+    #[error(
+        "worst-case cost of {provider}/{model} cannot be bounded: the provider billed \
+         more tokens than reserved earlier in this process"
+    )]
+    WorstCaseUnbounded {
+        /// Provider that billed beyond the bound.
+        provider: ProviderId,
+        /// Requested model.
+        model: ModelId,
+    },
+
     /// Daily spend limit would be exceeded (UTC day).
     #[error(
         "daily budget exceeded ({}): spent {spent} + estimated {requested} > limit {limit}",
@@ -261,7 +276,9 @@ impl AiError {
             Self::Authentication { .. } | Self::Authorization { .. } => ErrorKind::Authentication,
             Self::RateLimit { .. } => ErrorKind::RateLimit,
             Self::InsufficientBalance { .. } => ErrorKind::ProviderQuota,
-            Self::PricingUnavailable { .. } | Self::OutputLimitUnknown { .. } => ErrorKind::Pricing,
+            Self::PricingUnavailable { .. }
+            | Self::OutputLimitUnknown { .. }
+            | Self::WorstCaseUnbounded { .. } => ErrorKind::Pricing,
             Self::DailyLimitExceeded { .. }
             | Self::MonthlyLimitExceeded { .. }
             | Self::BudgetExceeded { .. } => ErrorKind::Budget,
@@ -341,6 +358,7 @@ impl AiError {
         match self {
             Self::PricingUnavailable { .. } => Some("pricing_unavailable"),
             Self::OutputLimitUnknown { .. } => Some("output_limit_unknown"),
+            Self::WorstCaseUnbounded { .. } => Some("worst_case_unbounded"),
             Self::DailyLimitExceeded { .. } => Some("daily_limit_exceeded"),
             Self::MonthlyLimitExceeded { .. } => Some("monthly_limit_exceeded"),
             Self::UsageUnavailable { .. } => Some("usage_unavailable"),
@@ -441,6 +459,7 @@ impl AiError {
             | Self::Cancelled
             | Self::PricingUnavailable { .. }
             | Self::OutputLimitUnknown { .. }
+            | Self::WorstCaseUnbounded { .. }
             | Self::DailyLimitExceeded { .. }
             | Self::MonthlyLimitExceeded { .. }
             | Self::UsageUnavailable { .. }) => other,

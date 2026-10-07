@@ -65,11 +65,7 @@ impl AgentMemoryStore {
     }
 
     /// List for agent (optionally filtered by subject).
-    pub async fn list(
-        &self,
-        agent_id: &AgentId,
-        subject_id: Option<&str>,
-    ) -> Vec<MemoryItem> {
+    pub async fn list(&self, agent_id: &AgentId, subject_id: Option<&str>) -> Vec<MemoryItem> {
         self.items
             .read()
             .await

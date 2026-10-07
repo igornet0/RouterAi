@@ -10,7 +10,10 @@ fn main() {
 
     println!("cargo:rerun-if-changed={}", dist_index.display());
     println!("cargo:rerun-if-changed={}", web_dir.join("src").display());
-    println!("cargo:rerun-if-changed={}", web_dir.join("package.json").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        web_dir.join("package.json").display()
+    );
 
     if dist_index.is_file() {
         return;

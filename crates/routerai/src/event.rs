@@ -47,11 +47,7 @@ pub struct Event {
 
 impl Event {
     /// Build a new event.
-    pub fn new(
-        event_type: impl Into<String>,
-        source: impl Into<String>,
-        payload: Value,
-    ) -> Self {
+    pub fn new(event_type: impl Into<String>, source: impl Into<String>, payload: Value) -> Self {
         Self {
             id: EventId::new(),
             event_type: event_type.into(),
@@ -142,7 +138,11 @@ impl EventBus {
     /// Recent history (newest last).
     pub async fn list(&self, limit: usize) -> Vec<Event> {
         let h = self.history.read().await;
-        h.iter().rev().take(limit).cloned().collect::<Vec<_>>()
+        h.iter()
+            .rev()
+            .take(limit)
+            .cloned()
+            .collect::<Vec<_>>()
             .into_iter()
             .rev()
             .collect()
@@ -173,7 +173,11 @@ mod tests {
     #[tokio::test]
     async fn emit_and_list() {
         let bus = EventBus::new(10);
-        let e = Event::new("telegram.message.received", "telegram", json!({"text": "hi"}));
+        let e = Event::new(
+            "telegram.message.received",
+            "telegram",
+            json!({"text": "hi"}),
+        );
         bus.emit(e.clone()).await.unwrap();
         let list = bus.list(10).await;
         assert_eq!(list.len(), 1);

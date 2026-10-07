@@ -22,6 +22,7 @@ use universal_ai::{
 };
 
 use crate::credentials::persist_from_client;
+use crate::pricing::PriceSheet;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -30,12 +31,15 @@ pub struct AppState {
     pub webhook_secret: Option<String>,
     /// Path to credentials.json for account/key metadata.
     pub credentials_path: PathBuf,
+    /// Price sheet in effect (rates with source and verification date).
+    pub prices: Arc<PriceSheet>,
 }
 
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/v1/doctor", get(doctor))
+        .route("/api/v1/pricing", get(list_pricing))
         .route("/api/v1/dashboard", get(dashboard))
         .route("/api/v1/settings/kill-switch", get(get_kill).post(set_kill))
         .route("/api/v1/audit", get(list_audit))
@@ -113,6 +117,10 @@ pub fn router(state: AppState) -> Router {
 
 async fn health() -> Json<Value> {
     Json(serde_json::json!({ "ok": true, "service": "routerai" }))
+}
+
+async fn list_pricing(State(state): State<AppState>) -> Json<Value> {
+    Json(serde_json::json!({ "prices": state.prices.prices }))
 }
 
 async fn doctor(State(state): State<AppState>) -> Json<Value> {
@@ -378,25 +386,87 @@ async fn delete_key(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
+/// HTTP status for a universal-ai error, by its machine-readable [`ErrorKind`].
+///
+/// [`ErrorKind`]: universal_ai::ErrorKind
 fn map_ai_err(err: universal_ai::AiError) -> (axum::http::StatusCode, String) {
     use axum::http::StatusCode;
-    use universal_ai::AiError;
-    let status = match &err {
-        AiError::NotFound { .. } => StatusCode::NOT_FOUND,
-        AiError::InvalidRequest { .. }
-        | AiError::UnsupportedModel { .. }
-        | AiError::Config { .. } => StatusCode::BAD_REQUEST,
-        AiError::BudgetExceeded { .. }
-        | AiError::DailyLimitExceeded { .. }
-        | AiError::MonthlyLimitExceeded { .. }
-        | AiError::PricingUnavailable { .. }
-        | AiError::OutputLimitUnknown { .. }
-        | AiError::UsageUnavailable { .. }
-        | AiError::InsufficientBalance { .. } => StatusCode::PAYMENT_REQUIRED,
-        AiError::Authentication { .. } | AiError::Authorization { .. } => StatusCode::UNAUTHORIZED,
+    use universal_ai::{AiError, ErrorKind};
+    let status = match err.kind() {
+        ErrorKind::Validation | ErrorKind::Configuration => StatusCode::BAD_REQUEST,
+        ErrorKind::NotFound => StatusCode::NOT_FOUND,
+        // Local spend limits, refusals to send an unpriced / unbounded request,
+        // and an exhausted provider balance.
+        ErrorKind::Budget | ErrorKind::Pricing | ErrorKind::Usage | ErrorKind::ProviderQuota => {
+            StatusCode::PAYMENT_REQUIRED
+        }
+        ErrorKind::RateLimit => StatusCode::TOO_MANY_REQUESTS,
+        ErrorKind::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        // The upstream provider rejected the server's credentials: a gateway
+        // failure, not a problem with the caller's own authentication.
+        ErrorKind::Authentication => StatusCode::BAD_GATEWAY,
+        ErrorKind::Provider if matches!(err, AiError::NoAvailableProvider { .. }) => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        ErrorKind::Provider | ErrorKind::Network => StatusCode::BAD_GATEWAY,
+        // nginx's "client closed request".
+        ErrorKind::Cancellation => {
+            StatusCode::from_u16(499).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+        }
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, err.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_ai_err;
+    use axum::http::StatusCode;
+    use universal_ai::{AiError, ProviderId};
+
+    fn status(err: AiError) -> u16 {
+        map_ai_err(err).0.as_u16()
+    }
+
+    #[test]
+    fn ai_errors_map_by_kind() {
+        let p = ProviderId::openai();
+        let http = |code| status(AiError::from_http_status(p.clone(), code, "x", None));
+        assert_eq!(http(400), 400, "invalid request");
+        assert_eq!(http(401), 502, "upstream credentials rejected");
+        assert_eq!(http(403), 502);
+        assert_eq!(http(402), 402, "provider quota");
+        assert_eq!(http(429), 429, "rate limited");
+        assert_eq!(http(503), 502, "provider failure");
+        assert_eq!(status(AiError::Timeout), 504);
+        assert_eq!(status(AiError::network("reset", true)), 502);
+        assert_eq!(status(AiError::Cancelled), 499);
+        assert_eq!(
+            status(AiError::BudgetExceeded {
+                message: "cap".into()
+            }),
+            402
+        );
+        assert_eq!(
+            status(AiError::NoAvailableProvider {
+                message: "none".into()
+            }),
+            503
+        );
+        assert_eq!(
+            status(AiError::NotFound {
+                message: "x".into()
+            }),
+            404
+        );
+        assert_eq!(
+            map_ai_err(AiError::Config {
+                message: "bad".into()
+            })
+            .0,
+            StatusCode::BAD_REQUEST
+        );
+    }
 }
 
 fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
