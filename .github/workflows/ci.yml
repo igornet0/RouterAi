@@ -85,7 +85,8 @@ jobs:
         run: cargo test --workspace --all-features --locked
 
   msrv:
-    name: MSRV (Rust ${{ env.MSRV }})
+    # `env` is not available in a job name; the step names show the version.
+    name: MSRV
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

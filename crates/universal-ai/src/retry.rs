@@ -55,7 +55,7 @@ impl RetryPolicy {
             && err.is_retryable()
             && err
                 .retry_after_secs()
-                .map_or(true, |s| Duration::from_secs(s) <= self.max_delay)
+                .is_none_or(|s| Duration::from_secs(s) <= self.max_delay)
     }
 }
 
